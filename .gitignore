@@ -1,0 +1,27 @@
+# Secrets & tokens - never commit
+backend/credentials/
+backend/.env
+*.env
+client_secret*.json
+token*.json
+
+# Local data (database, clips, logs)
+backend/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
