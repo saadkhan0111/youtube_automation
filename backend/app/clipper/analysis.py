@@ -79,8 +79,77 @@ def _fmt(t: float) -> str:
     return f"{t // 3600}:{t % 3600 // 60:02d}:{t % 60:02d}" if t >= 3600 else f"{t // 60:02d}:{t % 60:02d}"
 
 
+def quick_moments(curve: list[float], duration: float, min_len: int, max_len: int, max_n: int) -> list[dict]:
+    """Quick mode: the loudest stretches of the video (reactions, fights, hype) found from audio alone. Free and fast.
+
+    A moment is a loud peak with energy that lasts (mean of the 10 s around it above the video's normal level), so
+    a single bang scores lower than a sustained reaction. The clip starts well before the peak (the build-up) and
+    ends a little after it (the reaction)."""
+    if not curve:
+        return []
+    length = max(min_len, min(max_len, int((min_len + max_len) / 2)))
+    normal = sorted(curve)[len(curve) // 2]
+    out = []
+    for t, delta in media.loud_peaks(curve, top=max_n * 4, min_gap=max(10, length)):
+        around = curve[max(0, t - 3):t + 8]
+        sustained = sum(around) / len(around) - normal
+        if sustained < 3:
+            continue
+        start = max(0.0, min(t - 0.65 * length, duration - length))
+        end = min(duration, start + length)
+        if end - start < min_len:
+            continue
+        out.append({"start": round(start, 2), "end": round(end, 2), "peak": t,
+                    "score": round(min(10.0, 3 + sustained / 2.5 + delta / 6), 1), "sustained": round(sustained, 1)})
+    picked = []
+    for m in sorted(out, key=lambda m: m["score"], reverse=True):
+        if all(m["end"] <= x["start"] or m["start"] >= x["end"] for x in picked):
+            picked.append(m)
+        if len(picked) >= max_n:
+            break
+    return sorted(picked, key=lambda m: m["start"])
+
+
+def run_quick(project_id: int) -> None:
+    with session_scope() as s:
+        p = s.get(ClipProject, project_id)
+        source = Path(p.source_path)
+        min_len, max_len, max_n = p.min_clip_seconds, p.max_clip_seconds, p.max_candidates
+    if not source.is_file():
+        raise RuntimeError(f"Source video not found: {source}")
+    info = media.probe(source)
+    if not info["has_audio"]:
+        raise RuntimeError("Source video has no audio track; quick mode finds moments from the sound.")
+    _update(project_id, duration=info["duration"], width=info["width"], height=info["height"], status=ProjectStatus.ANALYZING,
+            progress=0.1, stage_message="Measuring loud moments (quick mode, no transcript)", error=None)
+    curve = media.loudness_curve(source)
+    moments = quick_moments(curve, info["duration"], min_len, max_len, max_n)
+    with session_scope() as s:
+        p = s.get(ClipProject, project_id)
+        for c in list(p.candidates):
+            if c.status in (CandidateStatus.PROPOSED, CandidateStatus.DISCARDED):
+                s.delete(c)
+        for m in moments:
+            s.add(ClipCandidate(project_id=project_id, start_time=m["start"], end_time=m["end"], score=m["score"],
+                                category="hype", headline="", hook_line="", outro_line="",
+                                reason=f"Loud moment at {_fmt(m['peak'])}: {m['sustained']:+.0f} LU above this video's normal level",
+                                excerpt=None))
+        p.status, p.progress = ProjectStatus.READY, 1.0
+        p.stage_message = f"Found {len(moments)} loud moments" if moments else "No standout loud moments: add clips manually"
+    record_event("clipper", f"Project #{project_id}: quick mode found {len(moments)} moments")
+
+
 def run_analysis(project_id: int) -> None:
     """Full analysis. Safe to re-run: audio chunks and chunk transcripts are cached on disk."""
+    with session_scope() as s:
+        plain = bool(s.get(ClipProject, project_id).plain)
+    if plain:
+        try:
+            run_quick(project_id)
+        except Exception as exc:
+            log.exception("quick analysis failed")
+            _update(project_id, status=ProjectStatus.FAILED, error=str(exc)[:2000], stage_message="Failed")
+        return
     try:
         with session_scope() as s:
             p = s.get(ClipProject, project_id)

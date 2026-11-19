@@ -54,13 +54,13 @@ def web_research(model: str, prompt: str, project_id: int | None = None, stage: 
 
 
 def chat_json(model: str, system: str, user: str, schema: dict, name: str = "result",
-              project_id: int | None = None, stage: str | None = None) -> dict:
-    """Structured JSON output (strict schema). Raises on refusal/truncation/invalid JSON."""
+              project_id: int | None = None, stage: str | None = None, images: list[bytes] | None = None) -> dict:
+    """Structured JSON output (strict schema); raises on refusal/truncation. `images` (JPEG bytes) go with the user message."""
     if chat_json_hook is not None:
         return chat_json_hook(model, system, user, schema)
     r = clip_ai.client().chat.completions.create(
         model=model,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": _content(user, images)}],
         response_format={"type": "json_schema", "json_schema": {"name": name, "schema": schema, "strict": True}},
     )
     costs.record(project_id, stage, "openai", "chat",
@@ -71,3 +71,15 @@ def chat_json(model: str, system: str, user: str, schema: dict, name: str = "res
     if choice.finish_reason == "length":
         raise RuntimeError("Model response was truncated.")
     return json.loads(choice.message.content)
+
+
+def _content(text: str, images: list[bytes] | None):
+    if not images:
+        return text
+    import base64
+
+    parts = [{"type": "text", "text": text}]
+    for img in images:
+        parts.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(img).decode(),
+                                                         "detail": "high"}})
+    return parts

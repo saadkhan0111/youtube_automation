@@ -117,6 +117,9 @@ def start() -> None:
     from .clipper import worker as clip_worker
 
     clip_worker.recover_on_startup()
+    from .clipper import live as clip_live
+
+    clip_live.recover_on_startup()
     from .studio import worker as studio_worker
 
     studio_worker.recover_on_startup()

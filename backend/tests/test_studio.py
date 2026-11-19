@@ -883,7 +883,7 @@ def test_assets_stage_end_to_end(client, assets_ready):
     assert _shot_state(o, "S2", 1)["asset"]["origin"] == "graphic" and not _shot_state(o, "S2", 1)["asset"]["has_file"]
     g = _shot_state(o, "S3", 0)["asset"]                                   # gameplay, empty library -> stock + a note
     assert g["origin"] == "pexels" and "No footage of your own" in g["note"]
-    ids = [a["meta"]["pexels_id"] for sc in o["scenes"] for s in sc["shots"] if (a := s["asset"]) and a["origin"] == "pexels"]
+    ids = [a["meta"]["stock_id"] for sc in o["scenes"] for s in sc["shots"] if (a := s["asset"]) and a["origin"] == "pexels"]
     assert len(ids) == len(set(ids))                                       # never the same clip twice
     assert o["counts"] == {"ready": 9, "missing": 0, "failed": 0, "pending": 0}
     assert o["credits"] and o["credits"][0].startswith("Video by Ana on Pexels: https://pexels.com/")
@@ -904,6 +904,7 @@ def test_assets_without_pexels_key_are_missing_not_faked(client, assets_ready, m
     pid, calls = assets_ready
     monkeypatch.setattr(amod, "pexels_hook", None)
     monkeypatch.delenv(ss.PEXELS_API_KEY_ENV, raising=False)
+    monkeypatch.delenv(ss.PIXABAY_API_KEY_ENV, raising=False)
     client.post(f"/api/studio/projects/{pid}/stages/assets/run", headers=H)
     o = _assets(client, pid)
     s = _shot_state(o, "S1", 0)
@@ -930,7 +931,7 @@ def test_replace_next_ai_and_upload(client, assets_ready):
     first = _shot_state(_assets(client, pid), "S1", 0)["asset"]
     o = client.post(f"{url}/S1/0/replace", json={"action": "next"}, headers=H).json()
     second = _shot_state(o, "S1", 0)["asset"]
-    assert second["meta"]["pexels_id"] != first["meta"]["pexels_id"] and first["meta"]["pexels_id"] in second["meta"]["tried"]
+    assert second["meta"]["stock_id"] != first["meta"]["stock_id"] and first["meta"]["stock_id"] in second["meta"]["tried"]
     assert _status(client.get(f"/api/studio/projects/{pid}").json(), "assets") == "review"    # approval re-opened
     o = client.post(f"{url}/S1/0/replace", json={"action": "ai_image"}, headers=H).json()
     assert _shot_state(o, "S1", 0)["asset"]["origin"] == "ai"
@@ -993,3 +994,383 @@ def test_ai_images_never_portray_real_people_and_flag_text():
     raw["scenes"][0]["shots"] = [_shot("ai_image", "ILLUSTRATION of a man who resembles the real suspect", share=1.0)]
     b = sbmod.validate(raw, _proj(), s, RESEARCH)
     assert any("real person" in w for w in b["scenes"][0]["warnings"])
+
+
+# ================================================================== step 7: editing engine
+from app.studio import editor, music
+from app.studio import timeline as tlmod
+
+
+def _voice_summary(board, dur=2.0):
+    return {"scenes": [{"scene_id": sc["scene_id"], "duration": dur, "pause_after": 0.25, "file": f"{sc['scene_id']}.wav",
+                        "words": [{"word": w, "start": 0.3 * i, "end": 0.3 * i + 0.25} for i, w in enumerate(sc["narration"].split()[:6])]}
+                       for sc in board["scenes"]]}
+
+
+def _board_for_timeline():
+    s = _script_with_ids()
+    b = sbmod.validate(_raw_board(s), _proj(), s, RESEARCH)
+    b["scenes"][1]["transition_out"] = "crossfade"
+    b["scenes"][3]["purpose"] = "reveal"
+    return b
+
+
+def test_timeline_frames_add_up_and_transitions_overlap():
+    b = _board_for_timeline()
+    tl = tlmod.build(b, _voice_summary(b), {}, "viral")
+    # each scene = voice + pause (+0.15 before a reveal, +tail on the last), in whole frames, no gaps
+    lens = [sc.end - sc.start for sc in tl.scenes]                       # boundaries are rounded once: +-1 frame
+    assert all(abs(x - tlmod.frames(2.25)) <= 1 for x in lens[:3])
+    assert abs(lens[3] - tlmod.frames(2.4)) <= 1 and abs(lens[-1] - tlmod.frames(2.25 + tlmod.TAIL)) <= 1
+    assert all(a.end == b2.start for a, b2 in zip(tl.shots, tl.shots[1:]))
+    assert tl.total_frames == tl.scenes[-1].end and tl.duration == pytest.approx(5 * 2.25 + 0.15 + 0.8, abs=0.05)
+    # narration of a reveal starts after the breath; captions use absolute times
+    assert tl.scenes[3].narration_at == pytest.approx(tlmod.secs(tl.scenes[3].start) + 0.15, abs=0.02)
+    assert tl.scenes[3].words[0]["start"] == pytest.approx(tl.scenes[3].narration_at, abs=0.01)
+    # transitions: hard cuts inside scenes (viral), the planned one between scenes, overlapping half/half
+    s2_last, s3_first = tl.scenes[1].shots[-1], tl.scenes[2].shots[0]
+    assert s2_last.trans_out == s3_first.trans_in == ("fade", 12)
+    assert s3_first.render_start == s3_first.start - 6 and s2_last.render_frames == (s2_last.end - s2_last.start) + 6
+    assert tl.scenes[0].shots[0].trans_out == (None, 0)                     # within scene: cut
+    # documentary style crossfades inside scenes too
+    tl2 = tlmod.build(b, _voice_summary(b), {}, "documentary")
+    assert tl2.scenes[0].shots[0].trans_out[0] == "fade"
+    # sound effects land on the scene's cuts; whooshes lead slightly
+    assert tl.sfx[0][0] == "whoosh" and tl.sfx[0][1] == 0.0
+    assert tl.sfx[1][1] == pytest.approx(tlmod.secs(tl.scenes[1].start) - tlmod.SFX_LEAD["whoosh"], abs=0.01)
+
+
+def test_timeline_requires_voice_for_every_scene():
+    b = _board_for_timeline()
+    v = _voice_summary(b)
+    v["scenes"].pop()
+    with pytest.raises(ValueError, match="no voiceover"):
+        tlmod.build(b, v, {}, "viral")
+
+
+def test_ass_has_captions_graphics_and_kicker():
+    b = _board_for_timeline()
+    b["scenes"][0]["on_screen_text"] = "Hidden details"
+    tl = tlmod.build(b, _voice_summary(b), {}, "viral")
+    ass = tlmod.build_ass(tl, "dynamic", "short")
+    assert "PlayResX: 1080" in ass and "PlayResY: 1920" in ass
+    assert "HIDDEN DETAILS" in ass                                            # scene kicker
+    assert "}PS5\\N{" in ass and "}TRAILER 2" in ass                           # graphic text + subtitle on its own line
+    assert ass.count(",Caption,") > 10                                        # word-by-word captions
+    lower = tlmod.build_ass(tl, "documentary_lower", "long")
+    assert "PlayResX: 1920" in lower and ",Lower," in lower and ",Caption," not in lower
+    assert tlmod.caption_style_of(b, "viral") == "dynamic"
+
+
+def test_music_only_accepts_commercial_friendly_licenses(env, monkeypatch, tmp_path):
+    assert music.license_ok("http://creativecommons.org/licenses/by/3.0/")
+    assert music.license_ok("http://creativecommons.org/licenses/by-sa/3.0/")
+    assert not music.license_ok("http://creativecommons.org/licenses/by-nc/3.0/")
+    assert not music.license_ok("http://creativecommons.org/licenses/by-nd/3.0/")
+    assert not music.license_ok(None)
+    monkeypatch.delenv(ss.JAMENDO_CLIENT_ID_ENV, raising=False)
+    assert music.pick("energetic", 60, "x") is None                         # nothing configured -> no music
+    tracks = [{"id": "1", "title": "NC", "artist": "A", "duration": 200, "audio": "u1", "download_allowed": True,
+               "license_url": "http://creativecommons.org/licenses/by-nc/3.0/", "page": "p1"},
+              {"id": "2", "title": "Good", "artist": "B", "duration": 200, "audio": "u2", "download_allowed": True,
+               "license_url": "http://creativecommons.org/licenses/by/3.0/", "page": "https://jamendo.com/t/2"}]
+    monkeypatch.setattr(music, "jamendo_hook", lambda mood: tracks)
+    monkeypatch.setattr(music, "download_hook", lambda url, dest: dest.write_bytes(b"mp3"))
+    t = music.pick("energetic", 60, "x")
+    assert t["id"] == "2" and t["source"] == "Jamendo" and "CC BY" in t["credit"] and "jamendo.com/t/2" in t["credit"]
+    # your own tracks win
+    d = music.music_root() / "energetic"
+    d.mkdir(parents=True)
+    (d / "mine.mp3").write_bytes(b"x")
+    assert music.pick("energetic", 60, "x")["source"] == "your library"
+
+
+@pytest.fixture()
+def render_ready(client, assets_ready, monkeypatch):
+    """Assets approved (stubbed sources), short 1s voice takes; music from a generated local track."""
+    pid, _ = assets_ready
+    client.post(f"/api/studio/projects/{pid}/stages/assets/run", headers=H)
+    client.post(f"/api/studio/projects/{pid}/stages/assets/approve", headers=H)
+    d = music.music_root() / "energetic"
+    d.mkdir(parents=True, exist_ok=True)
+    _ff("-f", "lavfi", "-i", "sine=f=220:d=20", "-ac", "2", str(d / "bed.wav"))
+    monkeypatch.setitem(worker.HANDLERS, "render", editor.run)
+    return pid
+
+
+def test_render_stage_end_to_end(client, render_ready):
+    pid = render_ready
+    r = client.get(f"/api/studio/projects/{pid}/render").json()
+    assert r["summary"] is None and r["music_local_tracks"] == 1
+    p = client.post(f"/api/studio/projects/{pid}/stages/render/run", headers=H).json()
+    assert _status(p, "render") == "review", p["stages"]
+    r = client.get(f"/api/studio/projects/{pid}/render").json()
+    s = r["summary"]
+    assert (s["width"], s["height"]) == (1080, 1920) and s["shots"] == 9 and s["segments_reused"] == 0
+    assert s["music"]["source"] == "your library" and not s["warnings"]
+    from app.clipper import media as cm
+    info = cm.probe(Path(s["file"]))
+    assert info["has_audio"] and info["duration"] == pytest.approx(s["duration"], abs=0.1)
+    with db.session_scope() as ses:
+        from app.studio.models import StudioProject as SP
+        voice = json.loads(ses.get(SP, pid).voice_json)["summary"]
+    expected = sum(x["duration"] + x["pause_after"] for x in voice["scenes"]) + tlmod.TAIL
+    assert s["duration"] == pytest.approx(expected, abs=0.15)
+    v = client.get(f"/api/studio/projects/{pid}/renders/{s['render_id']}/video")
+    assert v.status_code == 200 and v.headers["content-type"] == "video/mp4"
+    assert client.get(f"/api/studio/projects/{pid}/renders/{s['render_id']}/poster").status_code == 200
+    assert client.get(f"/api/studio/projects/{pid}/renders/999/video").status_code == 404
+    # re-render: every shot segment is reused
+    client.post(f"/api/studio/projects/{pid}/stages/render/run", headers=H)
+    s2 = client.get(f"/api/studio/projects/{pid}/render").json()
+    assert s2["summary"]["segments_reused"] == 9 and s2["summary"]["version"] == 2 and len(s2["renders"]) == 2
+
+
+def test_render_refuses_shots_without_visuals(client, render_ready):
+    pid = render_ready
+    with db.session_scope() as ses:
+        a = ses.query(StudioAsset).filter_by(project_id=pid, scene_id="S1", shot_index=0).one()
+        a.status, a.local_path = "missing", None
+    p = client.post(f"/api/studio/projects/{pid}/stages/render/run", headers=H).json()
+    st = next(s for s in p["stages"] if s["key"] == "render")
+    assert st["status"] == "failed" and "S1 shot 1" in st["error"]
+
+
+# ================================================================== step 8: quality check
+from app.studio import qa as qamod
+
+
+def test_spelling_complaints_about_our_own_overlays_are_dropped():
+    smp = {"kicker": "Background faces became story pieces", "graphic": "2017 / MacArthur Causeway", "caption_words": "the signs talk"}
+    assert qamod.about_our_text("Top title says “BACKGROUNG FACES” instead of “BACKGROUND FACES.”", smp)
+    assert qamod.about_our_text('Caption reads "the signs talk" wrongly', smp)
+    assert not qamod.about_our_text("Sign in the picture says “Kelly Cuonty”, should be “Kelly County”", smp)
+
+
+def test_measure_finds_silence_black_and_frozen(env, tmp_path):
+    f = tmp_path / "bad.mp4"
+    _ff("-f", "lavfi", "-i", "color=c=black:s=320x240:d=1.5:r=30", "-f", "lavfi", "-i", "testsrc=s=320x240:d=1.5:r=30",
+        "-f", "lavfi", "-i", "color=c=gray:s=320x240:d=3:r=30",
+        "-f", "lavfi", "-i", "sine=f=440:d=2", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo:d=4",
+        "-filter_complex", "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v];[3:a][4:a]concat=n=2:v=0:a=1[a]",
+        "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(f))
+    m = qamod.measure(f)
+    assert m["blacks"] and m["blacks"][0][0] == pytest.approx(0, abs=0.1)
+    assert m["silences"] and m["silences"][0][0] == pytest.approx(2.0, abs=0.2)
+    assert m["freezes"] and m["freezes"][0][0] >= 2.9
+    assert m["integrated"] is not None and m["true_peak"] is not None
+
+
+@pytest.fixture()
+def qa_ready(client, render_ready, monkeypatch):
+    pid = render_ready
+    client.post(f"/api/studio/projects/{pid}/stages/render/run", headers=H)
+    client.post(f"/api/studio/projects/{pid}/stages/render/approve", headers=H)
+    monkeypatch.setitem(worker.HANDLERS, "qa", qamod.run)
+    calls = []
+
+    def vision(model, system, user, schema):
+        calls.append(user)
+        n = user.count("\nFrame ") + (1 if user.startswith("Frame ") else 0)
+        frames = [{"frame": k + 1, "problems": []} for k in range(schema["properties"]["frames"]["items"]["properties"]["frame"]["maximum"])]
+        if len(calls) == 1:
+            frames[0]["problems"] = [{"type": "misspelled_text", "severity": "high", "detail": "Sign says “Vise City” not “Vice City”"}]
+            frames[6]["problems"] = [{"type": "misspelled_text", "severity": "high", "detail": "Label “PS6” should be “PS5”"}]   # S4 graphic
+        return {"frames": frames}
+
+    monkeypatch.setattr(llm, "chat_json_hook", vision)
+    return pid, calls
+
+
+def test_qa_stage_end_to_end_and_dismiss(client, qa_ready):
+    pid, calls = qa_ready
+    assert client.get(f"/api/studio/projects/{pid}/qa").json()["result"] is None
+    p = client.post(f"/api/studio/projects/{pid}/stages/qa/run", headers=H).json()
+    assert _status(p, "qa") == "review", p["stages"]
+    r = client.get(f"/api/studio/projects/{pid}/qa").json()["result"]
+    by = {c["id"]: c for c in r["checks"]}
+    assert by["format"]["status"] == "pass" and by["sync"]["status"] == "pass"
+    assert by["loudness"]["status"] == "pass" and by["peaks"]["status"] == "pass"
+    assert by["length"]["status"] == "warn"                                  # ~8s video vs 25s target
+    assert by["music"]["status"] == "pass" and by["credits"]["status"] == "pass"
+    assert len(calls) == 1 and "Frame 9" in calls[0]                         # 9 shots -> one call, all frames described
+    # the "PS5" complaint was about our own graphic text -> dropped; the picture's sign text is kept as a failure
+    vis = by["vis_misspelled_text"]
+    assert vis["status"] == "fail" and "Vise City" in vis["detail"] and "PS6" not in vis["detail"]
+    assert vis["frames"] and client.get(f"/api/studio/projects/{pid}/qa/frames/{vis['frames'][0]}").status_code == 200
+    assert client.get(f"/api/studio/projects/{pid}/qa/frames/..%2Fx.jpg").status_code == 404
+    assert r["passed"] is False
+    a = client.post(f"/api/studio/projects/{pid}/stages/qa/approve", headers=H)
+    assert a.status_code == 400 and "Misspelled text" in a.json()["detail"]
+    # the creator overrules the finding; it stops blocking and is recorded
+    d = client.post(f"/api/studio/projects/{pid}/qa/checks/vis_misspelled_text/dismiss", json={"note": "sign is fine"}, headers=H).json()
+    v2 = next(c for c in d["result"]["checks"] if c["id"] == "vis_misspelled_text")
+    assert v2["status"] == "dismissed" and v2["dismissed_note"] == "sign is fine" and d["result"]["passed"]
+    assert client.post(f"/api/studio/projects/{pid}/stages/qa/approve", headers=H).status_code == 200
+    # undo re-opens the approval and blocks again
+    client.post(f"/api/studio/projects/{pid}/qa/checks/vis_misspelled_text/dismiss", json={"undo": True}, headers=H)
+    assert _status(client.get(f"/api/studio/projects/{pid}").json(), "qa") == "review"
+    assert client.post(f"/api/studio/projects/{pid}/stages/qa/approve", headers=H).status_code == 400
+
+
+def test_objective_failures_cannot_be_dismissed(client, qa_ready, monkeypatch):
+    pid, _ = qa_ready
+    real = qamod.streams
+
+    def broken(path):
+        s = real(path)
+        s["audio"]["duration"] = "1.0"
+        return s
+
+    monkeypatch.setattr(qamod, "streams", broken)
+    client.post(f"/api/studio/projects/{pid}/stages/qa/run", headers=H)
+    r = client.get(f"/api/studio/projects/{pid}/qa").json()["result"]
+    assert next(c for c in r["checks"] if c["id"] == "sync")["status"] == "fail"
+    d = client.post(f"/api/studio/projects/{pid}/qa/checks/sync/dismiss", json={"note": "meh"}, headers=H)
+    assert d.status_code == 400 and "can't be dismissed" in d.json()["detail"]
+
+
+# ================================================================== step 9: package + hand-off
+from app.studio import package as pkmod
+from app.studio.models import StudioRender
+
+
+def test_title_checks():
+    allowed = "Trailer 2 was captured on PS5 in 2025 and mirrors a 2017 incident"
+    assert pkmod.check_title("Trailer 2 Was Captured on PS5", allowed) == []
+    w = pkmod.check_title("You Won't Believe These 12 Secrets", allowed)
+    assert any("Clickbait" in x for x in w) and any("12" in x for x in w)
+    assert any("capitals" in x for x in pkmod.check_title("GTA 6 SECRETS REVEALED NOW", allowed + " 6"))
+    assert any("70" in x for x in pkmod.check_title("x" * 80, allowed))
+
+
+def test_description_keeps_sources_and_credits_and_trims_the_intro():
+    meta = {"intro": "word " * 2000, "hashtags": ["#GTA6", "#Shorts"]}
+    sources = [{"title": "Rockstar", "url": "https://rockstargames.com/VI"}]
+    cred = {"stock": ["Video by Ana on Pexels: https://pexels.com/1"], "music": "Music: \"X\" by Y (Jamendo, CC BY)", "ai_images": 2}
+    d = pkmod.build_description(meta, sources, cred)
+    assert len(d.encode("utf-8")) <= 5000
+    for part in ("Sources:", "https://rockstargames.com/VI", "Video by Ana on Pexels", "Jamendo, CC BY", "AI-generated illustrations", "#GTA6 #Shorts"):
+        assert part in d
+    assert d.startswith("word word") and "…" in d
+
+
+@pytest.fixture()
+def package_ready(client, qa_ready, monkeypatch):
+    pid, _ = qa_ready
+    client.post(f"/api/studio/projects/{pid}/stages/qa/run", headers=H)
+    client.post(f"/api/studio/projects/{pid}/qa/checks/vis_misspelled_text/dismiss", json={"note": "fine"}, headers=H)
+    assert client.post(f"/api/studio/projects/{pid}/stages/qa/approve", headers=H).status_code == 200
+    monkeypatch.setitem(worker.HANDLERS, "package", pkmod.run)
+    with db.session_scope() as ses:
+        pr = ses.get(StudioProject, pid)
+        r = json.loads(pr.research_json)
+        r["sources"] = [{"id": f"S{i}", "url": f"https://example.org/{i}", "title": f"Source {i}"} for i in (1, 2, 3, 9)]
+        pr.research_json = json.dumps(r)
+    monkeypatch.setattr(llm, "chat_json_hook", lambda m, s, u, sc: {
+        "titles": [{"title": "Trailer 2 Was Captured on PS5", "angle": "fact"},
+                   {"title": "You Won't Believe These 99 Secrets", "angle": "bait"}],
+        "intro": "Hidden details from the GTA VI trailers.", "hashtags": ["#GTA6", "GTAVI"],
+        "tags": ["gta 6 trailer", "gta vi details"], "pinned_comment": "Which one did you miss?",
+        "thumbnail_texts": ["Hidden Clues", "PS5 Footage"]})
+    return pid
+
+
+def test_package_stage_and_handoff_to_videos(client, package_ready):
+    pid = package_ready
+    assert client.get(f"/api/studio/projects/{pid}/package").json()["package"] is None
+    p = client.post(f"/api/studio/projects/{pid}/stages/package/run", headers=H).json()
+    assert _status(p, "package") == "review", p["stages"]
+    pk = client.get(f"/api/studio/projects/{pid}/package").json()["package"]
+    assert pk["title"] == "Trailer 2 Was Captured on PS5"                   # the clean option ranks first
+    bait = next(t for t in pk["titles"] if "Believe" in t["title"])
+    assert any("99" in w for w in bait["warnings"]) and any("Clickbait" in w for w in bait["warnings"])
+    assert pk["hashtags"][0] == "#Shorts" and "#GTAVI" in pk["hashtags"]   # Shorts tag added, hashes fixed
+    assert "Sources:" in pk["description"] and "pexels.com" in pk["description"] and "AI-generated" in pk["description"]
+    assert "https://example.org/1" in pk["description"] and "https://example.org/9" not in pk["description"]   # only cited sources
+    assert pk["category_id"] == "20" and len(pk["thumbnails"]) == 3
+    img = client.get(f"/api/studio/projects/{pid}/package/files/{pk['thumbnail']}")
+    assert img.status_code == 200 and img.headers["content-type"] == "image/jpeg"
+    assert client.get(f"/api/studio/projects/{pid}/package/files/..%2Fapp.db").status_code == 404
+    # edits: title, chosen thumbnail, remade thumbnail text
+    r = client.patch(f"/api/studio/projects/{pid}/package", json={"title": "My Own Title", "intro": "New intro.",
+                                                                   "thumbnail": pk["thumbnails"][2]["file"]}, headers=H).json()["package"]
+    assert r["title"] == "My Own Title" and r["description"].startswith("New intro.") and r["thumbnail"] == pk["thumbnails"][2]["file"]
+    r = client.post(f"/api/studio/projects/{pid}/package/thumbnails/2", json={"text": "Look Closer"}, headers=H).json()["package"]
+    assert r["thumbnails"][2]["text"] == "Look Closer" and r["thumbnail"] == r["thumbnails"][2]["file"]
+    assert client.patch(f"/api/studio/projects/{pid}/package", json={"thumbnail": "nope.jpg"}, headers=H).status_code == 400
+    # approve -> the render goes to the Videos queue, pending review, with the package metadata
+    a = client.post(f"/api/studio/projects/{pid}/stages/package/approve", headers=H).json()
+    assert _status(a, "package") == "approved" and _status(a, "complete") == "approved"
+    vid = client.get(f"/api/studio/projects/{pid}/package").json()["package"]["handoff"]["video_id"]
+    from app.models import Video
+    with db.session_scope() as ses:
+        v = ses.get(Video, vid)
+        assert v.status == "pending_review" and v.title == "My Own Title" and v.metadata_source == "clipper"
+        assert v.permission_status == "original" and "Sources:" in v.description and v.category_id == "20"
+        assert Path(v.file_path).is_file()
+    with db.session_scope() as ses:
+        r = ses.query(StudioRender).filter_by(project_id=pid, status="done").order_by(StudioRender.id.desc()).first()
+        assert Path(r.file_path).is_file()                                  # the project keeps its own render
+    assert pkmod.handoff(pid) == vid                                        # idempotent
+    assert client.patch(f"/api/studio/projects/{pid}/package", json={"title": "x"}, headers=H).status_code == 400
+
+
+
+# ------------------------------------------------------------------ Pixabay as a second stock provider
+PIXABAY_VIDEOS = {"hits": [
+    {"id": 11, "pageURL": "https://pixabay.com/videos/id-11/", "duration": 9, "user": "Kim", "user_id": 5, "videos": {
+        "large": {"url": "https://cdn.pixabay.com/11_large.mp4", "width": 1920, "height": 1080},
+        "medium": {"url": "https://cdn.pixabay.com/11_medium.mp4", "width": 1280, "height": 720},
+        "tiny": {"url": "", "width": 0, "height": 0}}},
+    {"id": 12, "pageURL": "https://pixabay.com/videos/id-12/", "duration": 7, "user": "Lee", "user_id": 6, "videos": {
+        "large": {"url": "https://cdn.pixabay.com/12_large.mp4", "width": 1080, "height": 1920}}},
+]}
+
+
+def test_pixabay_search_prefers_matching_orientation_and_caches_24h(env, monkeypatch):
+    monkeypatch.setenv(ss.PIXABAY_API_KEY_ENV, "k")
+    calls = []
+
+    class Resp:
+        def __init__(self, data):
+            self.data = data
+
+        def read(self):
+            return json.dumps(self.data).encode()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def fake_open(req, timeout=0):
+        calls.append(req.full_url)
+        return Resp(PIXABAY_VIDEOS)
+
+    monkeypatch.setattr(amod.urllib.request, "urlopen", fake_open)
+    v = amod._pixabay_search("video", "miami beach", "portrait")
+    assert [c["id"] for c in v] == ["xv12", "xv11"]                          # the vertical clip first for a Short
+    assert v[1]["url"].endswith("11_large.mp4") and v[0]["author"] == "Lee" and "users/Lee-6" in v[0]["author_url"]
+    amod._pixabay_search("video", "miami beach", "portrait")
+    assert len(calls) == 1 and "key=k" in calls[0] and "safesearch=true" in calls[0]   # second search served from cache
+    assert amod.stock_providers() == ["pixabay"] or "pexels" in amod.stock_providers()
+
+
+def test_assets_with_only_pixabay_configured(client, assets_ready, monkeypatch):
+    pid, calls = assets_ready
+    pex = amod.pexels_hook
+    monkeypatch.setattr(amod, "pexels_hook", None)
+    monkeypatch.delenv(ss.PEXELS_API_KEY_ENV, raising=False)
+    monkeypatch.setattr(amod, "pixabay_hook", lambda kind, q, o: [{**c, "id": "x" + c["id"]} for c in pex(kind, q, o)])
+    client.post(f"/api/studio/projects/{pid}/stages/assets/run", headers=H)
+    o = _assets(client, pid)
+    assert o["stock_providers"] == ["pixabay"] and o["counts"]["missing"] == 0
+    v = _shot_state(o, "S1", 0)["asset"]
+    assert v["origin"] == "pixabay" and v["attribution"] == "Video by Ana on Pixabay" and "Pixabay Content License" in v["license"]
+    assert v["meta"]["stock_id"].startswith("x") and v["meta"]["provider"] == "pixabay"
+    assert any("on Pixabay" in c for c in o["credits"])
+    # "next" works for Pixabay results too
+    o2 = client.post(f"/api/studio/projects/{pid}/assets/shots/S1/0/replace", json={"action": "next"}, headers=H).json()
+    assert _shot_state(o2, "S1", 0)["asset"]["meta"]["stock_id"] != v["meta"]["stock_id"]

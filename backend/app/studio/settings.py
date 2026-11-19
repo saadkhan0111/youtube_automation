@@ -17,11 +17,13 @@ STRUCTURE_MODEL = os.environ.get("STUDIO_STRUCTURE_MODEL", clip_settings.OPENAI_
 SCRIPT_MODEL = os.environ.get("STUDIO_SCRIPT_MODEL", "gpt-5.5")
 # In testing gpt-5.5 planned 30 varied shots that matched each line; gpt-4o-mini planned vague shots and empty graphics.
 STORYBOARD_MODEL = os.environ.get("STUDIO_STORYBOARD_MODEL", "gpt-5.5")
+QA_MODEL = os.environ.get("STUDIO_QA_MODEL", "gpt-5.5")             # reviews rendered frames (vision)
 IMAGE_MODEL = os.environ.get("STUDIO_IMAGE_MODEL", "gpt-image-1.5")
 TTS_MODEL = clip_settings.OPENAI_TTS_MODEL
 TRANSCRIBE_MODEL = clip_settings.OPENAI_TRANSCRIBE_MODEL
 
 PEXELS_API_KEY_ENV = "PEXELS_API_KEY"
+PIXABAY_API_KEY_ENV = "PIXABAY_API_KEY"
 JAMENDO_CLIENT_ID_ENV = "JAMENDO_CLIENT_ID"
 
 CATEGORIES = {
@@ -55,10 +57,10 @@ VOICES = clip_settings.TTS_VOICES
 DEFAULT_VOICE = clip_settings.OPENAI_TTS_VOICE
 
 # Voiceover runs before Assets: footage is picked and trimmed to the REAL length of each recorded scene.
-STAGES = ["research", "script", "storyboard", "voice", "assets", "render", "qa", "complete"]
+STAGES = ["research", "script", "storyboard", "voice", "assets", "render", "qa", "package", "complete"]
 STAGE_LABELS = {
     "research": "Research", "script": "Script", "storyboard": "Storyboard", "assets": "Assets",
-    "voice": "Voiceover", "render": "Rendering", "qa": "Quality check", "complete": "Complete",
+    "voice": "Voiceover", "render": "Rendering", "qa": "Quality check", "package": "Package", "complete": "Complete",
 }
 
 
@@ -83,10 +85,11 @@ def options() -> dict:
         "stages": [{"key": s, "label": STAGE_LABELS[s]} for s in STAGES],
         "openai_key_present": clip_settings.openai_available(),
         "pexels_key_present": bool(os.environ.get(PEXELS_API_KEY_ENV)),
+        "pixabay_key_present": bool(os.environ.get(PIXABAY_API_KEY_ENV)),
         "jamendo_key_present": bool(os.environ.get(JAMENDO_CLIENT_ID_ENV)),
         "storyboard": _storyboard_options(),
         "models": {"research": RESEARCH_MODEL, "structure": STRUCTURE_MODEL, "script": SCRIPT_MODEL, "storyboard": STORYBOARD_MODEL,
-                   "image": IMAGE_MODEL, "tts": TTS_MODEL, "transcribe": TRANSCRIBE_MODEL},
+                   "image": IMAGE_MODEL, "qa": QA_MODEL, "tts": TTS_MODEL, "transcribe": TRANSCRIBE_MODEL},
     }
 
 

@@ -39,6 +39,10 @@ CAPTION_LOWER_Y = 1230    # lower-middle third, above YouTube's bottom UI
 HOOK_AT = 0.25
 
 
+class _NoEffects(Exception):
+    pass
+
+
 def _update(cid: int, **fields) -> None:
     with session_scope() as s:
         c = s.get(ClipCandidate, cid)
@@ -94,7 +98,8 @@ def _render(cid: int, preview: bool = False) -> Path | None:
         start, end = c.start_time, c.end_time
         headline, hook, outro = (c.headline or "").strip(), (c.hook_line or "").strip(), (c.outro_line or "").strip()
         project = {k: getattr(p, k) for k in ("id", "name", "source_path", "source_url", "source_creator",
-                                              "permission_status", "permission_notes", "topic_hint", "width", "height", "voice")}
+                                              "permission_status", "permission_notes", "topic_hint", "width", "height", "voice",
+                                              "plain")}
         cat, reason, excerpt = c.category, c.reason, c.excerpt
     source = Path(project["source_path"])
     if not source.is_file():
@@ -114,6 +119,9 @@ def _render(cid: int, preview: bool = False) -> Path | None:
 
     # ---------- voice (hook now; the outro is placed once the output length is known)
     hook_voice, outro_voice = None, None   # (path, duration, text)
+    plain = bool(project["plain"])        # quick mode: just the clip (+ your title card if you typed one)
+    if plain:
+        hook = outro = ""
     if hook:
         hp = voice.synth(hook, work / "hook.wav", project["voice"])
         hook_voice = (hp, media.media_duration(hp), hook)
@@ -123,13 +131,17 @@ def _render(cid: int, preview: bool = False) -> Path | None:
     _update(cid, render_progress=0.15)
 
     # ---------- effects plan: impacts in the clip decide where punches/shake/booms/slow motion go
-    transcript = load_transcript(project["id"]) or {"words": []}
+    transcript = ({"words": []} if plain else load_transcript(project["id"])) or {"words": []}
     clip_words = [{"start": w["start"] - start, "end": w["end"] - start, "word": w["word"]}
                   for w in transcript.get("words", []) if w["end"] > start and w["start"] < end]
     try:
+        if plain:
+            raise _NoEffects
         # loud jumps, then the transcript separates real impacts (no speech) from shouts and dialogue
         raw = effects.detect_impacts(effects.clip_loudness(ff, source, start, D), D)
         impacts = effects.classify(raw, clip_words, effects.scene_cuts(ff, source, start, D) if raw else [])
+    except _NoEffects:
+        impacts = []
     except Exception as exc:
         log.warning("impact detection failed: %s", exc)
         impacts = []
@@ -138,7 +150,7 @@ def _render(cid: int, preview: bool = False) -> Path | None:
         protected.append((HOOK_AT, HOOK_AT + hook_voice[1]))
     if outro_voice:
         protected.append((D - outro_voice[1] - 1.0, D))
-    ep = effects.plan(impacts, D, protected)
+    ep = effects.plan(impacts, D, protected, allow_slowmo=not plain)
     tm = ep.timemap
     DO = round(tm.duration(D), 3)                          # output duration (longer if slow motion)
 
@@ -162,9 +174,10 @@ def _render(cid: int, preview: bool = False) -> Path | None:
         for i, (v, zc) in enumerate(zip(e, z)):
             if off + i < n:
                 env[off + i], zcr[off + i], mask[off + i] = v, zc, True
-    avatar.render_avatar_video(work / "avatar.mov", DO, FPS, env, mask, ff, zcr=zcr,
-                               impacts=[(t, 1.0) for t in ep.impact_times_out()]
-                               + [(t, 0.55) for t in ep.emphasis_times_out()], seed=cid)
+    if not plain:
+        avatar.render_avatar_video(work / "avatar.mov", DO, FPS, env, mask, ff, zcr=zcr,
+                                   impacts=[(t, 1.0) for t in ep.impact_times_out()]
+                                   + [(t, 0.55) for t in ep.emphasis_times_out()], seed=cid)
     _update(cid, render_progress=0.3)
 
     # ---------- framing (where the gameplay goes and how the crop follows the action)
@@ -217,8 +230,8 @@ def _render(cid: int, preview: bool = False) -> Path | None:
 
     # ---------- filter graph (everything after the retime step runs on the output timeline)
     outro_window = next(((at, at + dur) for path, at, dur, _ in voices if outro_voice and path == outro_voice[0]), None)
-    zoom = effects.zoom_expr(ep, DO, outro_window)
-    shake_x, shake_y = effects.shake_terms(ep)
+    zoom = "1" if plain else effects.zoom_expr(ep, DO, outro_window)
+    shake_x, shake_y = ("0", "0") if plain else effects.shake_terms(ep)
     duck = "+".join(f"between(t,{a - 0.1:.2f},{b + 0.15:.2f})" for a, b in voice_windows) or "0"
     pw, ph, py = fr.panel_w, fr.panel_h, fr.panel_y
     if fr.layout == "fill":
@@ -231,21 +244,21 @@ def _render(cid: int, preview: bool = False) -> Path | None:
         a, b = tm.slow
         f = tm.factor
         # video: normal | half speed (motion-interpolated so it stays smooth) | normal
-        fc.append(f"[0:v]fps={FPS},split=3[p0][p1][p2]")
+        fc.append(f"[0:v]setpts=PTS-STARTPTS,fps={FPS},split=3[p0][p1][p2]")
         fc.append(f"[p0]trim=0:{a:.3f},setpts=PTS-STARTPTS[q0]")
         fc.append(f"[p1]trim={a:.3f}:{b:.3f},setpts=(PTS-STARTPTS)*{f},"
                   f"minterpolate=fps={FPS}:mi_mode=mci:mc_mode=aobmc:vsbmc=1[q1]")
         fc.append(f"[p2]trim={b:.3f},setpts=PTS-STARTPTS[q2]")
         fc.append(f"[q0][q1][q2]concat=n=3:v=1:a=0,fps={FPS}[vin]")
         # audio: the slowed part is pitched down (deep, cinematic)
-        fc.append("[0:a]aresample=48000,aformat=channel_layouts=stereo,asplit=3[r0][r1][r2]")
+        fc.append("[0:a]asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo,asplit=3[r0][r1][r2]")
         fc.append(f"[r0]atrim=0:{a:.3f},asetpts=PTS-STARTPTS[t0]")
         fc.append(f"[r1]atrim={a:.3f}:{b:.3f},asetpts=PTS-STARTPTS,asetrate={int(48000 / f)},aresample=48000[t1]")
         fc.append(f"[r2]atrim={b:.3f},asetpts=PTS-STARTPTS[t2]")
         fc.append("[t0][t1][t2]concat=n=3:v=0:a=1[ain]")
     else:
-        fc.append(f"[0:v]fps={FPS}[vin]")
-        fc.append("[0:a]aresample=48000,aformat=channel_layouts=stereo[ain]")
+        fc.append(f"[0:v]setpts=PTS-STARTPTS,fps={FPS}[vin]")
+        fc.append("[0:a]asetpts=PTS-STARTPTS,aresample=48000,aformat=channel_layouts=stereo[ain]")
 
     fc += [
         "[vin]split=2[s1][s2]",
@@ -260,36 +273,37 @@ def _render(cid: int, preview: bool = False) -> Path | None:
          f"drawbox=x=0:y={py + ph}:w={W}:h=18:color=black@0.45:t=fill[bgs]") if not full_frame else "[bg]null[bgs]",
         f"[bgs][fg]overlay=0:{py}[b1]",
         # converting the avatar to yuva420p first keeps the overlay cheap (format=auto converts every frame)
-        "[1:v]format=yuva420p[avy]",
-        f"[b1][avy]overlay={AVATAR_X}:{avatar_y}:format=yuv420[b2]",
+        "[b1]null[b2]" if plain else "[1:v]format=yuva420p[avy]",
+        "" if plain else f"[b1][avy]overlay={AVATAR_X}:{avatar_y}:format=yuv420[b2]",
         "[b2]subtitles=subs.ass:fontsdir=fonts[b3]",
         # flash-in at the start and a short flash on each impact; fade out at the end
-        f"[b3]eq=brightness='{effects.brightness_expr(ep)}':eval=frame,"
+        f"[b3]eq=brightness='{'0' if plain else effects.brightness_expr(ep)}':eval=frame,"
         f"fade=t=out:st={DO - 0.45:.2f}:d=0.45,format=yuv420p[v]",
         f"[ain]volume='if({duck},0.22,1)':eval=frame[ga]",
     ]
     mix_inputs = ["[ga]"]
     extra_inputs: list[Path] = []
+    base = 1 if plain else 2                                # input 1 is the avatar track (not in quick mode)
     for path, at, _, _ in voices:
-        idx = 2 + len(extra_inputs)
+        idx = base + len(extra_inputs)
         extra_inputs.append(path)
         ms = int(at * 1000)
         fc.append(f"[{idx}:a]aresample=48000,aformat=channel_layouts=stereo,adelay={ms}|{ms},volume=1.7[vo{idx}]")
         mix_inputs.append(f"[vo{idx}]")
     sfx = effects.ensure_sfx(ff, settings.data_dir / "sfx")
-    for name, at, vol in effects.sfx_cues(ep, card_end if headline else None):
-        idx = 2 + len(extra_inputs)
+    for name, at, vol in ([] if plain else effects.sfx_cues(ep, card_end if headline else None)):
+        idx = base + len(extra_inputs)
         extra_inputs.append(sfx[name])
         ms = int(at * 1000)
         fc.append(f"[{idx}:a]aresample=48000,aformat=channel_layouts=stereo,adelay={ms}|{ms},volume={vol}[sx{idx}]")
         mix_inputs.append(f"[sx{idx}]")
     fc.append("".join(mix_inputs) + f"amix=inputs={len(mix_inputs)}:normalize=0:duration=first:dropout_transition=0,"
               f"afade=t=in:d=0.15,afade=t=out:st={DO - 0.45:.2f}:d=0.45,loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[a]")
-    filter_complex = ";\n".join(fc)
+    filter_complex = ";\n".join(x for x in fc if x)
     (work / "filter.txt").write_text(filter_complex, encoding="utf-8")
 
     out = work / "short.mp4"
-    inputs = ["-ss", f"{start:.3f}", "-t", f"{D:.3f}", "-i", str(source), "-i", "avatar.mov"]
+    inputs = ["-ss", f"{start:.3f}", "-t", f"{D:.3f}", "-i", str(source)] + ([] if plain else ["-i", "avatar.mov"])
     for path in extra_inputs:
         inputs += ["-i", path.name if path.parent == work else str(path)]
 
@@ -339,6 +353,13 @@ def _render(cid: int, preview: bool = False) -> Path | None:
         "transcript": excerpt,
         "original_commentary": " / ".join(v[3] for v in voices) or None,
     }
+    if plain:
+        # quick mode: no AI metadata. Title = your title card text (or the project name); the description credits
+        # the creator and links the original stream.
+        title = headline or f"{project['name']}"[:95]
+        credit = f"Clip from {project['source_creator']}'s stream" if project["source_creator"] else "Clip"
+        sidecar.update({"title": title, "hashtags": ["#Shorts"], "tags": [],
+                        "description": f"{credit}: {project['source_url']}" if project["source_url"] else credit})
     final = work / f"short_p{project['id']}_m{cid}.mp4"
     out.rename(final)
     side = final.with_suffix(".json")

@@ -15,6 +15,7 @@ log = logging.getLogger("ytshorts.clipper.worker")
 
 _analysis_q: "queue.Queue[int]" = queue.Queue()
 _render_q: "queue.Queue[int]" = queue.Queue()
+_download_q: "queue.Queue[int]" = queue.Queue()
 _threads: dict[str, threading.Thread] = {}
 _lock = threading.Lock()
 
@@ -48,6 +49,17 @@ def enqueue_analysis(project_id: int) -> None:
         return
     _ensure("analysis", _analysis_q, analysis.run_analysis)
     _analysis_q.put(project_id)
+
+
+def enqueue_download(project_id: int) -> None:
+    """YouTube imports run in their own queue so a long download never blocks analyses."""
+    from . import youtube_import
+
+    if synchronous:
+        youtube_import.run_download(project_id)
+        return
+    _ensure("download", _download_q, youtube_import.run_download)
+    _download_q.put(project_id)
 
 
 def enqueue_render(candidate_id: int) -> None:

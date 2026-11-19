@@ -10,7 +10,7 @@ MAX_TITLE = 100
 MAX_DESCRIPTION_BYTES = 5000
 MAX_TAGS_CHARS = 500
 MAX_HASHTAGS = 5
-ALLOWED_CATEGORIES = {"20": "Gaming", "24": "Entertainment", "22": "People & Blogs"}
+ALLOWED_CATEGORIES = {"20": "Gaming", "24": "Entertainment", "22": "People & Blogs", "27": "Education", "28": "Science & Technology"}
 
 _ANGLE = re.compile(r"[<>]")
 

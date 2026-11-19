@@ -13,3 +13,4 @@ anthropic>=1.0
 python-multipart>=0.0.12
 openai>=1.50
 pillow>=10
+yt-dlp[default]>=2026.10

@@ -1,4 +1,4 @@
-"""Workflow state machine: Research -> Script -> Storyboard -> Assets -> Voiceover -> Rendering -> Quality check -> Complete.
+"""Workflow state machine: Research -> Script -> Storyboard -> Voiceover -> Assets -> Rendering -> Quality check -> Package -> Complete.
 
 Each stage has a status:
   locked    earlier stages are not approved yet

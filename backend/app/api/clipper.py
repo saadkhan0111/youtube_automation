@@ -35,7 +35,9 @@ def candidate_dict(c: ClipCandidate) -> dict:
 def project_dict(p: ClipProject, with_candidates: bool = False) -> dict:
     d = {
         "id": p.id, "name": p.name, "source_file": Path(p.source_path).name, "source_mode": p.source_mode,
-        "source_url": p.source_url, "source_creator": p.source_creator, "permission_status": p.permission_status,
+        "source_url": p.source_url, "source_creator": p.source_creator,
+        "range_start": p.clip_range_start, "range_end": p.clip_range_end, "plain": bool(p.plain),
+        "live_recording_id": p.live_recording_id, "live_part": p.live_part, "permission_status": p.permission_status,
         "permission_notes": p.permission_notes, "topic_hint": p.topic_hint, "duration": p.duration,
         "resolution": f"{p.width}x{p.height}" if p.width else None, "status": p.status, "progress": p.progress,
         "stage_message": p.stage_message, "error": p.error, "max_candidates": p.max_candidates,
@@ -127,6 +129,7 @@ class ProjectOptions(BaseModel):
     min_clip_seconds: int = Field(20, ge=8, le=120)
     max_clip_seconds: int = Field(60, ge=10, le=180)
     voice: str | None = None
+    plain: bool = False          # quick mode: loud moments only, no transcript / AI voice / captions (free)
 
 
 class LinkedProject(ProjectOptions):
@@ -140,13 +143,13 @@ def _create(db: Session, path: Path, mode: str, opts: ProjectOptions) -> ClipPro
         raise HTTPException(400, "Minimum length must be below maximum length.")
     if opts.voice and opts.voice not in cs.TTS_VOICES:
         raise HTTPException(400, "Unknown voice.")
-    if not cs.openai_available():
+    if not opts.plain and not cs.openai_available():
         raise HTTPException(400, "OPENAI_API_KEY is missing in backend/.env (needed for transcription and moment detection).")
     p = ClipProject(
         name=(opts.name or path.stem)[:255], source_path=str(path), source_mode=mode, topic_hint=opts.topic_hint,
         source_url=opts.source_url, source_creator=opts.source_creator, permission_status=opts.permission_status,
         permission_notes=opts.permission_notes, max_candidates=opts.max_candidates,
-        min_clip_seconds=opts.min_clip_seconds, max_clip_seconds=opts.max_clip_seconds, voice=opts.voice,
+        min_clip_seconds=opts.min_clip_seconds, max_clip_seconds=opts.max_clip_seconds, voice=opts.voice, plain=opts.plain,
         status=ProjectStatus.EXTRACTING, progress=0.0, stage_message="Queued",
     )
     db.add(p)
@@ -173,6 +176,7 @@ def create_uploaded(
     file: UploadFile = File(...), name: str = Form(""), topic_hint: str = Form(""), source_url: str = Form(""),
     source_creator: str = Form(""), permission_status: str = Form("unknown"), permission_notes: str = Form(""),
     max_candidates: int = Form(8), min_clip_seconds: int = Form(20), max_clip_seconds: int = Form(60), voice: str = Form(""),
+    plain: bool = Form(False),
     db: Session = DBDep,
 ):
     ext = Path(file.filename or "").suffix.lower()
@@ -181,7 +185,7 @@ def create_uploaded(
     opts = ProjectOptions(name=name or Path(file.filename).stem, topic_hint=topic_hint or None, source_url=source_url or None,
                           source_creator=source_creator or None, permission_status=permission_status,
                           permission_notes=permission_notes or None, max_candidates=max_candidates,
-                          min_clip_seconds=min_clip_seconds, max_clip_seconds=max_clip_seconds, voice=voice or None)
+                          min_clip_seconds=min_clip_seconds, max_clip_seconds=max_clip_seconds, voice=voice or None, plain=plain)
     dest = cs.sources_dir() / f"{uuid.uuid4().hex[:8]}{ext}"
     tmp = dest.with_suffix(".uploading")
     with tmp.open("wb") as out:
@@ -217,6 +221,12 @@ def reanalyze(pid: int, db: Session = DBDep):
     p = _project(db, pid)
     if p.status in ProjectStatus.BUSY:
         raise HTTPException(400, "Analysis is already running.")
+    if p.source_mode == "youtube" and not Path(p.source_path).is_file():
+        # the YouTube download never finished (failed, cancelled or interrupted): fetch it again first
+        p.status, p.progress, p.error, p.stage_message = ProjectStatus.DOWNLOADING, 0.0, None, "Queued for download"
+        db.commit()
+        worker.enqueue_download(p.id)
+        return project_dict(p)
     p.status, p.progress, p.error, p.stage_message = ProjectStatus.EXTRACTING, 0.0, None, "Queued"
     db.commit()
     worker.enqueue_analysis(p.id)
@@ -228,7 +238,7 @@ def delete_project(pid: int, db: Session = DBDep):
     p = _project(db, pid)
     if p.status in ProjectStatus.BUSY or any(c.status in (CandidateStatus.QUEUED, CandidateStatus.RENDERING) for c in p.candidates):
         raise HTTPException(400, "Wait until analysis/rendering has finished.")
-    if p.source_mode == "uploaded":
+    if p.source_mode in ("uploaded", "youtube", "live"):
         Path(p.source_path).unlink(missing_ok=True)  # only files we stored ourselves; linked files are never touched
     shutil.rmtree(cs.projects_dir() / str(p.id), ignore_errors=True)
     db.delete(p)
@@ -315,3 +325,157 @@ def discard(cid: int, db: Session = DBDep):
         raise HTTPException(400, "Can't discard while rendering.")
     c.status = CandidateStatus.DISCARDED
     return {"ok": True}
+
+
+# ------------------------------------------------------------------ import from a YouTube link
+class YouTubeProbe(BaseModel):
+    url: str = Field(max_length=500)
+
+
+@router.post("/youtube/probe")
+def youtube_probe(body: YouTubeProbe):
+    from ..clipper import youtube_import as yi
+
+    try:
+        return yi.probe(body.url)
+    except yi.ImportError_ as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class YouTubeProject(ProjectOptions):
+    url: str = Field(max_length=500)
+    start: str | None = None          # h:mm:ss, mm:ss or seconds
+    end: str | None = None
+
+
+@router.post("/projects/youtube")
+def create_from_youtube(body: YouTubeProject, db: Session = DBDep):
+    """Download only the chosen section of the video (background job), then analyse it like any other source."""
+    from ..clipper import youtube_import as yi
+
+    if body.permission_status not in (PermissionStatus.ORIGINAL, PermissionStatus.AUTHORIZED, PermissionStatus.LICENSED):
+        raise HTTPException(400, "Only import videos that are yours or that the creator allowed you to clip "
+                                 "(permission status: original, authorized or licensed).")
+    if body.permission_status != PermissionStatus.ORIGINAL and not (body.permission_notes or "").strip():
+        raise HTTPException(400, "Add your proof of permission (e.g. 'Discord DM from the streamer, 18 Nov 2026').")
+    try:
+        start, end = yi.parse_time(body.start), yi.parse_time(body.end)
+        info = yi.probe(body.url)
+        start, end = yi.check_range(info, start, end)
+    except yi.ImportError_ as exc:
+        raise HTTPException(400, str(exc)) from exc
+    def hms(x: float) -> str:
+        return f"{int(x // 3600)}:{int(x % 3600 // 60):02d}:{int(x % 60):02d}"
+    opts = body.model_copy(update={
+        "name": body.name or f"{info['title']} ({hms(start)}-{hms(end)})"[:255],
+        "source_url": info["url"] + (f"&t={int(start)}s" if "?" in info["url"] else f"?t={int(start)}s"),
+        "source_creator": body.source_creator or info["channel"],
+    })
+    dest = cs.sources_dir() / f"yt_{info['id']}_{int(start)}_{int(end)}_{uuid.uuid4().hex[:6]}.mp4"
+    p = _create(db, dest, "youtube", opts)
+    p.status, p.stage_message = ProjectStatus.DOWNLOADING, "Queued for download"
+    p.clip_range_start, p.clip_range_end = start, end
+    p.duration = info.get("duration")          # length of the whole video (replaced by the section length after download)
+    p.source_url = info["url"]
+    db.commit()
+    record_event("clipper", f"Clip project #{p.id}: importing {hms(start)}-{hms(end)} of \"{info['title']}\" "
+                            f"by {opts.source_creator} (permission: {p.permission_status})")
+    worker.enqueue_download(p.id)
+    return project_dict(p)
+
+
+@router.post("/projects/{pid}/cancel-download")
+def cancel_download(pid: int, db: Session = DBDep):
+    from ..clipper import youtube_import as yi
+
+    p = _project(db, pid)
+    if p.status != ProjectStatus.DOWNLOADING:
+        raise HTTPException(400, "Not downloading.")
+    yi.cancel(pid)
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ live recording
+def live_dict(r) -> dict:
+    return {"id": r.id, "url": r.url, "title": r.title, "channel": r.channel, "status": r.status, "message": r.message,
+            "error": r.error, "part_minutes": r.part_minutes, "max_minutes": r.max_minutes,
+            "recorded_seconds": r.recorded_seconds, "parts_done": r.parts_done, "size_mb": round((r.bytes_written or 0) / 1e6),
+            "source_creator": r.source_creator, "permission_status": r.permission_status,
+            "started_at": iso(r.started_at), "ended_at": iso(r.ended_at), "created_at": iso(r.created_at)}
+
+
+class LiveIn(BaseModel):
+    url: str = Field(max_length=500)
+    part_minutes: int = Field(30, ge=5, le=120)
+    max_minutes: int = Field(360, ge=10, le=720)
+    source_creator: str | None = Field(None, max_length=255)
+    permission_status: str = "authorized"
+    permission_notes: str | None = Field(None, max_length=2000)
+    max_candidates: int = Field(5, ge=1, le=20)
+    min_clip_seconds: int = Field(20, ge=8, le=120)
+    max_clip_seconds: int = Field(45, ge=10, le=180)
+
+
+@router.get("/live")
+def list_live(db: Session = DBDep):
+    from ..models import LiveRecording
+
+    rows = db.scalars(select(LiveRecording).order_by(LiveRecording.id.desc()).limit(30)).all()
+    out = []
+    for r in rows:
+        d = live_dict(r)
+        d["projects"] = [{"id": p.id, "part": p.live_part, "status": p.status, "candidates": len(p.candidates), "duration": p.duration}
+                         for p in db.scalars(select(ClipProject).where(ClipProject.live_recording_id == r.id).order_by(ClipProject.live_part))]
+        out.append(d)
+    return out
+
+
+@router.post("/live")
+def start_live(body: LiveIn, db: Session = DBDep):
+    """Start recording a stream that is live now. Finished parts become quick-mode clip projects automatically."""
+    from ..clipper import live
+    from ..models import LiveRecording, LiveStatus
+
+    if body.permission_status not in (PermissionStatus.ORIGINAL, PermissionStatus.AUTHORIZED, PermissionStatus.LICENSED):
+        raise HTTPException(400, "Only record streams that are yours or that the creator allowed you to clip.")
+    if body.permission_status != PermissionStatus.ORIGINAL and not (body.permission_notes or "").strip():
+        raise HTTPException(400, "Add your proof of permission (e.g. 'Discord DM from the streamer, 18 Nov 2026').")
+    if body.min_clip_seconds >= body.max_clip_seconds:
+        raise HTTPException(400, "Minimum clip length must be below the maximum.")
+    try:
+        info = live.resolve(body.url)
+    except live.LiveError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if info["live_status"] != "is_live":
+        msg = {"is_upcoming": "This stream hasn't started yet. Start recording once it's live.",
+               "was_live": "This stream has ended. Use 'From YouTube link' to import the replay.",
+               "post_live": "This stream has just ended. Use 'From YouTube link' to import the replay once it's processed."}
+        raise HTTPException(400, msg.get(info["live_status"], "This video isn't a live stream. Use 'From YouTube link' instead."))
+    busy = db.scalars(select(LiveRecording).where(LiveRecording.url == info["url"],
+                                                  LiveRecording.status.in_(list(LiveStatus.ACTIVE)))).first()
+    if busy:
+        raise HTTPException(400, f"This stream is already being recorded (recording #{busy.id}).")
+    r = LiveRecording(url=info["url"], title=info.get("title"), channel=info.get("channel"), part_minutes=body.part_minutes,
+                      max_minutes=body.max_minutes, source_creator=body.source_creator or info.get("channel"),
+                      permission_status=body.permission_status, permission_notes=body.permission_notes,
+                      max_candidates=body.max_candidates, min_clip_seconds=body.min_clip_seconds,
+                      max_clip_seconds=body.max_clip_seconds, status=LiveStatus.STARTING, message="Connecting")
+    db.add(r)
+    db.commit()
+    record_event("clipper", f"Live recording #{r.id} started: \"{r.title}\" by {r.source_creator} (permission: {r.permission_status})")
+    live.start(r.id, first_info=info)
+    return live_dict(r)
+
+
+@router.post("/live/{rid}/stop")
+def stop_live(rid: int, db: Session = DBDep):
+    from ..clipper import live
+    from ..models import LiveRecording
+
+    r = db.get(LiveRecording, rid)
+    if r is None:
+        raise HTTPException(404, "Recording not found")
+    if not live.stop(rid):
+        raise HTTPException(400, "This recording isn't running.")
+    db.expire_all()
+    return live_dict(db.get(LiveRecording, rid))

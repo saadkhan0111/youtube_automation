@@ -281,12 +281,13 @@ class EventLog(Base):
 # --------------------------------------------------------------------------- clipping engine
 class ProjectStatus:
     CREATED = "created"
+    DOWNLOADING = "downloading"          # YouTube import in progress
     EXTRACTING = "extracting_audio"
     TRANSCRIBING = "transcribing"
     ANALYZING = "finding_moments"
     READY = "ready"
     FAILED = "failed"
-    BUSY = {EXTRACTING, TRANSCRIBING, ANALYZING}
+    BUSY = {DOWNLOADING, EXTRACTING, TRANSCRIBING, ANALYZING}
 
 
 class CandidateStatus:
@@ -306,7 +307,12 @@ class ClipProject(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(255))
     source_path: Mapped[str] = mapped_column(String(1024))
-    source_mode: Mapped[str] = mapped_column(String(16), default="linked")  # linked | uploaded
+    source_mode: Mapped[str] = mapped_column(String(16), default="linked")  # linked | uploaded | youtube
+    clip_range_start: Mapped[float | None] = mapped_column(Float)   # YouTube import: section of the original video
+    clip_range_end: Mapped[float | None] = mapped_column(Float)
+    plain: Mapped[bool] = mapped_column(Boolean, default=False)       # quick mode: no transcript, no AI voice/captions
+    live_recording_id: Mapped[int | None] = mapped_column(Integer, index=True)   # part of a live recording
+    live_part: Mapped[int | None] = mapped_column(Integer)
     source_url: Mapped[str | None] = mapped_column(String(1024))
     source_creator: Mapped[str | None] = mapped_column(String(255))
     permission_status: Mapped[str] = mapped_column(String(32), default="unknown")
@@ -355,3 +361,40 @@ class ClipCandidate(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 
     project: Mapped[ClipProject] = relationship(back_populates="candidates")
+
+
+class LiveStatus:
+    STARTING = "starting"
+    RECORDING = "recording"
+    STOPPING = "stopping"
+    FINISHED = "finished"      # stream ended, or stopped by the user / time limit
+    FAILED = "failed"
+    ACTIVE = {STARTING, RECORDING, STOPPING}
+
+
+class LiveRecording(Base):
+    """A YouTube live stream being recorded in parts; every finished part becomes a quick-mode Clipper project."""
+
+    __tablename__ = "live_recordings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    url: Mapped[str] = mapped_column(String(1024))
+    title: Mapped[str | None] = mapped_column(String(512))
+    channel: Mapped[str | None] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(16), default=LiveStatus.STARTING, index=True)
+    message: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    part_minutes: Mapped[int] = mapped_column(Integer, default=30)
+    max_minutes: Mapped[int] = mapped_column(Integer, default=360)
+    recorded_seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    parts_done: Mapped[int] = mapped_column(Integer, default=0)
+    bytes_written: Mapped[int] = mapped_column(Integer, default=0)
+    permission_status: Mapped[str] = mapped_column(String(32), default="authorized")
+    permission_notes: Mapped[str | None] = mapped_column(Text)
+    source_creator: Mapped[str | None] = mapped_column(String(255))
+    max_candidates: Mapped[int] = mapped_column(Integer, default=5)
+    min_clip_seconds: Mapped[int] = mapped_column(Integer, default=20)
+    max_clip_seconds: Mapped[int] = mapped_column(Integer, default=45)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

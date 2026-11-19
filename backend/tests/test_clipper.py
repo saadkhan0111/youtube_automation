@@ -556,3 +556,223 @@ def test_voice_api(client):
         pid = p.id
     assert client.patch(f"/api/clipper/projects/{pid}", json={"voice": "marin"}, headers=H).json()["voice"] == "marin"
     assert client.patch(f"/api/clipper/projects/{pid}", json={"voice": "nope"}, headers=H).status_code == 400
+
+
+# ------------------------------------------------------------------ import from a YouTube link
+from app.clipper import youtube_import as yi
+
+
+def test_youtube_url_time_and_range_rules():
+    assert yi.is_youtube_url("https://www.youtube.com/watch?v=abc") and yi.is_youtube_url("https://youtu.be/abc")
+    assert yi.is_youtube_url("https://www.youtube.com/live/abc?si=x")
+    assert not yi.is_youtube_url("https://evil.com/youtube.com") and not yi.is_youtube_url("ftp://youtube.com/x")
+    assert yi.parse_time("1:20:05") == 4805 and yi.parse_time("80:05") == 4805 and yi.parse_time("42") == 42
+    assert yi.parse_time("") is None and yi.parse_time(None) is None
+    with pytest.raises(yi.ImportError_):
+        yi.parse_time("1h20")
+    info = {"live_status": "was_live", "duration": 6 * 3600}
+    assert yi.check_range(info, 3600, 5400) == (3600, 5400)
+    for s, e, msg in [(100, 50, "after the start"), (0, 10, "at least 30"), (0, 5 * 3600, "at most 4 hours"), (0, 7 * 3600, "after the end")]:
+        with pytest.raises(yi.ImportError_, match=msg):
+            yi.check_range(info, s, e)
+    with pytest.raises(yi.ImportError_, match="still live"):
+        yi.check_range({"live_status": "is_live", "duration": None}, 0, 60)
+    # strategy: small slice of a long stream -> range download; a big share -> full download + local cut
+    assert not yi.use_full_download(1800, 6 * 3600) and yi.use_full_download(3 * 3600, 6 * 3600)
+    assert not yi.use_full_download(60, None)
+
+
+class FakeYDL:
+    """Stands in for yt_dlp.YoutubeDL: returns metadata, and 'downloads' by generating a local video."""
+    calls = []
+    duration = 3600
+
+    def __init__(self, params):
+        self.params = params
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def extract_info(self, url, download=False):
+        FakeYDL.calls.append((url, download, dict(self.params)))
+        if "private" in url:
+            raise RuntimeError("ERROR: [youtube] x: Private video. Sign in if you've been granted access")
+        info = {"id": "vid123", "title": "Big stream", "channel": "Streamer", "duration": FakeYDL.duration, "live_status": "was_live",
+                "webpage_url": "https://www.youtube.com/watch?v=vid123", "thumbnail": "t.jpg", "chapters": []}
+        if download:
+            for h in self.params.get("progress_hooks", []):
+                h({"status": "downloading", "downloaded_bytes": 5_000_000, "total_bytes": 10_000_000})
+            out = self.params["outtmpl"].replace("%(ext)s", "mp4")
+            ranges = self.params.get("download_ranges")
+            make_source(out, seconds=40 if ranges else 60)
+        return info
+
+
+@pytest.fixture()
+def yt(client, monkeypatch):
+    FakeYDL.calls = []
+    monkeypatch.setattr(yi, "ydl_factory", FakeYDL)
+    monkeypatch.setattr(worker, "synchronous", True)
+    return FakeYDL
+
+
+def test_youtube_probe(client, yt):
+    r = client.post("/api/clipper/youtube/probe", json={"url": "https://youtu.be/vid123"}, headers=H).json()
+    assert r["title"] == "Big stream" and r["channel"] == "Streamer" and r["was_live"] and r["duration"] == 3600
+    assert yt.calls[0][2]["skip_download"] and yt.calls[0][2]["noplaylist"]
+    bad = client.post("/api/clipper/youtube/probe", json={"url": "https://youtu.be/private"}, headers=H)
+    assert bad.status_code == 400 and "private" in bad.json()["detail"].lower()
+    assert client.post("/api/clipper/youtube/probe", json={"url": "https://vimeo.com/1"}, headers=H).status_code == 400
+
+
+@needs_ffmpeg
+def test_youtube_import_requires_permission_proof_then_downloads_and_analyses(client, yt):
+    body = {"url": "https://www.youtube.com/watch?v=vid123", "start": "10:00", "end": "11:00", "min_clip_seconds": 10}
+    r = client.post("/api/clipper/projects/youtube", json={**body, "permission_status": "unknown"}, headers=H)
+    assert r.status_code == 400 and "creator allowed" in r.json()["detail"]
+    r = client.post("/api/clipper/projects/youtube", json={**body, "permission_status": "authorized"}, headers=H)
+    assert r.status_code == 400 and "proof" in r.json()["detail"]
+    r = client.post("/api/clipper/projects/youtube", json={**body, "permission_status": "authorized",
+                                                           "permission_notes": "Discord DM 18 Nov"}, headers=H)
+    assert r.status_code == 200, r.text
+    pid = r.json()["id"]
+    p = client.get(f"/api/clipper/projects/{pid}").json()
+    assert p["status"] == "ready" and p["candidates"], p                    # downloaded, then analysed as usual
+    assert p["source_creator"] == "Streamer" and p["permission_status"] == "authorized" and p["permission_notes"] == "Discord DM 18 Nov"
+    assert p["source_url"] == "https://www.youtube.com/watch?v=vid123" and (p["range_start"], p["range_end"]) == (600, 660)
+    assert p["name"] == "Big stream (0:10:00-0:11:00)" and p["duration"] == pytest.approx(40, abs=0.5)
+    dl = [c for c in yt.calls if c[1]][0][2]
+    assert "download_ranges" in dl and "force_keyframes_at_cuts" not in dl     # 60s of a 1h video: range download
+    with db.session_scope() as s:
+        src = s.get(ClipProject, pid).source_path
+    from pathlib import Path
+    assert Path(src).is_file() and Path(src).parent == cs.sources_dir()
+    client.delete(f"/api/clipper/projects/{pid}", headers=H)
+    assert not Path(src).exists()                                            # our own download is cleaned up
+
+
+@needs_ffmpeg
+def test_youtube_import_big_share_downloads_full_and_cuts_locally(client, yt, monkeypatch):
+    monkeypatch.setattr(FakeYDL, "duration", 300)                         # 40s of a 5-min video = 13%
+    r = client.post("/api/clipper/projects/youtube", json={"url": "https://www.youtube.com/watch?v=vid123", "start": "0:00:05",
+                                                           "end": "0:00:45", "permission_status": "original"}, headers=H)
+    assert r.status_code == 200, r.text
+    p = client.get(f"/api/clipper/projects/{r.json()['id']}").json()
+    dl = [c for c in yt.calls if c[1]][0][2]
+    assert "download_ranges" not in dl                                       # whole video fetched, then cut with ffmpeg
+    # a stream-copy cut starts at the keyframe before the requested start (no re-encode): a few seconds of pre-roll
+    assert 40 <= p["duration"] <= 40 + 9
+
+
+@needs_ffmpeg
+def test_failed_import_is_retried_by_analyze_again(client, yt, monkeypatch):
+    real = FakeYDL.extract_info
+
+    def flaky(self, url, download=False):
+        if download:
+            raise RuntimeError("ERROR: network unreachable")
+        return real(self, url, download)
+
+    monkeypatch.setattr(FakeYDL, "extract_info", flaky)
+    r = client.post("/api/clipper/projects/youtube", json={"url": "https://www.youtube.com/watch?v=vid123", "start": "1:00",
+                                                           "end": "2:00", "permission_status": "original", "min_clip_seconds": 10}, headers=H)
+    pid = r.json()["id"]
+    p = client.get(f"/api/clipper/projects/{pid}").json()
+    assert p["status"] == "failed" and "network unreachable" in p["error"]
+    monkeypatch.setattr(FakeYDL, "extract_info", real)
+    client.post(f"/api/clipper/projects/{pid}/analyze", headers=H)
+    p = client.get(f"/api/clipper/projects/{pid}").json()
+    assert p["status"] == "ready" and p["candidates"]
+
+
+# ------------------------------------------------------------------ quick mode + live recording
+from app.clipper import live as livemod
+from app.models import LiveRecording
+
+
+def test_quick_moments_pick_sustained_loud_stretches():
+    curve = [-30.0] * 300
+    for i in range(100, 112):
+        curve[i] = -14.0            # a sustained reaction around 1:40
+    curve[200] = -10.0              # a single bang at 3:20 (not sustained)
+    for i in range(250, 256):
+        curve[i] = -16.0
+    m = analysis.quick_moments(curve, 300, 20, 40, 5)
+    assert m and m[0]["peak"] in range(100, 112)
+    first = m[0]
+    assert first["end"] - first["start"] == 30 and first["start"] < first["peak"] < first["end"]
+    assert first["peak"] - first["start"] > first["end"] - first["peak"]       # build-up before, reaction after
+    assert all(x["peak"] != 200 for x in m)                                     # a lone bang isn't a moment
+    assert all(a["end"] <= b["start"] for a, b in zip(m, m[1:]))                # no overlaps
+    assert analysis.quick_moments([], 0, 20, 40, 5) == []
+
+
+@needs_ffmpeg
+def test_quick_mode_project_needs_no_openai_and_renders_plain(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(cs, "openai_available", lambda: False)
+    calls = []
+    monkeypatch.setattr(ai, "transcribe_hook", lambda p: calls.append("whisper"))
+    monkeypatch.setattr(ai, "tts_hook", lambda t, o: calls.append("tts"))
+    src = make_source(tmp_path / "s.mp4", seconds=40)
+    r = client.post("/api/clipper/projects", json={"source_path": str(src), "plain": True, "permission_status": "authorized",
+                                                   "permission_notes": "ok", "source_creator": "Streamer",
+                                                   "source_url": "https://youtube.com/watch?v=x",
+                                                   "min_clip_seconds": 10, "max_clip_seconds": 20}, headers=H)
+    assert r.status_code == 200, r.text
+    p = client.get(f"/api/clipper/projects/{r.json()['id']}").json()
+    assert p["plain"] and p["status"] == "ready" and p["candidates"], p
+    c = p["candidates"][0]
+    assert c["start_time"] < 20 < c["end_time"] and "Loud moment" in c["reason"] and not c["hook_line"]   # the 20-22 s spike
+    client.patch(f"/api/clipper/candidates/{c['id']}", json={"headline": "He did NOT see that coming"}, headers=H)
+    client.post(f"/api/clipper/projects/{p['id']}/render", json={"candidate_ids": [c["id"]]}, headers=H)
+    c2 = next(x for x in client.get(f"/api/clipper/projects/{p['id']}").json()["candidates"] if x["id"] == c["id"])
+    assert c2["status"] == "rendered", c2
+    with db.session_scope() as s:
+        v = s.get(Video, c2["video_id"])
+        assert v.title == "He did NOT see that coming" and v.status == VideoStatus.PENDING_REVIEW
+        assert "Clip from Streamer's stream: https://youtube.com/watch?v=x" in v.description and "#Shorts" in v.hashtags_json
+        assert v.width == 1080 and v.height == 1920
+    assert calls == []                                                          # no Whisper, no AI voice
+
+
+@needs_ffmpeg
+def test_live_recording_in_parts(client, tmp_path, monkeypatch):
+    src = make_source(tmp_path / "live.mp4", seconds=40)
+    states = iter(["is_live", "was_live", "was_live"])
+    monkeypatch.setattr(livemod, "resolve_hook", lambda url: {
+        "live_status": next(states, "was_live"), "title": "Big stream", "channel": "Streamer",
+        "url": "https://www.youtube.com/watch?v=live1", "stream_url": str(src), "headers": {}})
+    monkeypatch.setattr(livemod, "SECONDS_PER_PART_MINUTE", 3)                   # "5-minute" parts become 15 s
+    monkeypatch.setattr(livemod, "MIN_PART_SECONDS", 5)
+    base = {"url": "https://www.youtube.com/watch?v=live1", "part_minutes": 5, "max_minutes": 60, "min_clip_seconds": 8,
+            "max_clip_seconds": 12}
+    r = client.post("/api/clipper/live", json={**base, "permission_status": "unknown"}, headers=H)
+    assert r.status_code == 400
+    r = client.post("/api/clipper/live", json={**base, "permission_notes": ""}, headers=H)
+    assert r.status_code == 400 and "proof" in r.json()["detail"]
+    r = client.post("/api/clipper/live", json={**base, "permission_notes": "Discord DM"}, headers=H)
+    assert r.status_code == 200, r.text
+    rid = r.json()["id"]
+    livemod.wait(rid, timeout=120)
+    rec = next(x for x in client.get("/api/clipper/live").json() if x["id"] == rid)
+    assert rec["status"] == "finished" and rec["message"] == "Stream ended", rec
+    parts = rec["projects"]
+    assert len(parts) >= 2 and [p["part"] for p in parts] == sorted(p["part"] for p in parts)   # ~40 s in 15 s parts
+    for pp in parts:
+        p = client.get(f"/api/clipper/projects/{pp['id']}").json()
+        assert p["plain"] and p["status"] == "ready" and p["source_creator"] == "Streamer" and p["permission_notes"] == "Discord DM"
+        assert "Big stream · part" in p["name"]
+    assert sum(p["duration"] for p in parts) == pytest.approx(40, abs=4)
+    # the same stream can't be recorded twice at once; a finished one can't be stopped
+    assert client.post(f"/api/clipper/live/{rid}/stop", headers=H).status_code == 400
+
+
+def test_live_rejects_streams_that_are_not_live(client, monkeypatch):
+    for status, text in [("is_upcoming", "hasn't started"), ("was_live", "has ended"), ("not_live", "isn't a live stream")]:
+        monkeypatch.setattr(livemod, "resolve_hook", lambda url, s=status: {"live_status": s, "title": "x", "channel": "y",
+                                                                            "url": url, "stream_url": None, "headers": {}})
+        r = client.post("/api/clipper/live", json={"url": "https://youtu.be/x", "permission_status": "original"}, headers=H)
+        assert r.status_code == 400 and text in r.json()["detail"]

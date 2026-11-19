@@ -1,7 +1,8 @@
 """Assets stage: find or make one visual for every storyboard shot.
 
 Sources, by the shot's visual_type:
-  stock_video / stock_image -> Pexels API (needs PEXELS_API_KEY; free). No key or no result -> "missing".
+  stock_video / stock_image -> Pexels and/or Pixabay APIs (PEXELS_API_KEY / PIXABAY_API_KEY, both free; either one is
+                               enough). No key or no result -> "missing".
   ai_image                  -> OpenAI image model, in the project's one visual style; always labelled as an illustration.
   gameplay / user_footage   -> the creator's own videos (Videos library + AI Clipper sources). None -> stock -> missing.
   graphic                   -> nothing to fetch: drawn by the renderer (title cards, stat callouts, ...).
@@ -39,11 +40,16 @@ IMAGE_QUALITY = os.environ.get("STUDIO_IMAGE_QUALITY", "medium")      # low | me
 IMAGE_WORKERS = 3
 MAX_DOWNLOAD = 120 * 1024 * 1024
 PEXELS_LICENSE = "Pexels License: free to use, attribution appreciated"
+PIXABAY_LICENSE = "Pixabay Content License: free for commercial use, no attribution required"
+LICENSES = {"pexels": PEXELS_LICENSE, "pixabay": PIXABAY_LICENSE}
+STOCK_ORIGINS = ("pexels", "pixabay")
+PIXABAY_CACHE_HOURS = 24          # Pixabay's API terms: cache search results for 24 hours
 AI_LICENSE = "AI-generated illustration (OpenAI), owned by you"
 UA = "InfoVideoStudio/1.0"
 
 # Test hooks
 pexels_hook = None     # fn(kind, query, orientation) -> list[candidate dict] (same shape as _pexels_search output)
+pixabay_hook = None    # same, for Pixabay
 download_hook = None   # fn(url, dest) -> None
 image_hook = None      # fn(prompt, size) -> png bytes
 
@@ -55,6 +61,23 @@ class AssetError(Exception):
 # --------------------------------------------------------------------------- shot helpers
 def pexels_key() -> str:
     return os.environ.get(ss.PEXELS_API_KEY_ENV, "").strip()
+
+
+def pixabay_key() -> str:
+    return os.environ.get(ss.PIXABAY_API_KEY_ENV, "").strip()
+
+
+def stock_providers() -> list[str]:
+    out = []
+    if pexels_key() or pexels_hook is not None:
+        out.append("pexels")
+    if pixabay_key() or pixabay_hook is not None:
+        out.append("pixabay")
+    return out
+
+
+def stock_id(meta: dict) -> str | None:
+    return meta.get("stock_id") or meta.get("pexels_id")
 
 
 def shots_of(board: dict) -> list[tuple[str, int, dict, dict]]:
@@ -159,6 +182,80 @@ def _pexels_search(kind: str, query: str, orient: str) -> list[dict]:
     return out
 
 
+# --------------------------------------------------------------------------- Pixabay
+def _pixabay_get(path: str, params: dict) -> dict:
+    """GET with the 24-hour response cache Pixabay's API terms require."""
+    import time
+
+    query = {"key": pixabay_key(), **params}
+    cache_dir = ss.studio_dir() / "cache" / "pixabay"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = cache_dir / (hashlib.sha1(json.dumps([path, params], sort_keys=True).encode()).hexdigest() + ".json")
+    if cache.exists() and time.time() - cache.stat().st_mtime < PIXABAY_CACHE_HOURS * 3600:
+        return json.loads(cache.read_text(encoding="utf-8"))
+    url = f"https://pixabay.com/{path}?{urllib.parse.urlencode(query)}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": UA}), timeout=20) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (400, 401, 403):
+            raise AssetError("Pixabay rejected the API key (check PIXABAY_API_KEY).") from exc
+        if exc.code == 429:
+            raise AssetError("Pixabay rate limit reached (100 requests/minute). Try again in a minute.") from exc
+        raise AssetError(f"Pixabay error {exc.code}") from exc
+    cache.write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
+def _pixabay_user_url(hit: dict) -> str | None:
+    return f"https://pixabay.com/users/{hit.get('user')}-{hit.get('user_id')}/" if hit.get("user") else None
+
+
+def _pixabay_search(kind: str, query: str, orient: str) -> list[dict]:
+    if pixabay_hook is not None:
+        return pixabay_hook(kind, query, orient)
+    portrait = orient == "portrait"
+    out = []
+    if kind == "video":
+        data = _pixabay_get("api/videos/", {"q": query[:100], "per_page": 20, "safesearch": "true"})
+        for v in data.get("hits", []):
+            sizes = [s for s in (v.get("videos") or {}).values() if s.get("url") and s.get("width")]
+            ok = [s for s in sizes if min(s["width"], s["height"]) >= 720] or sizes
+            if not ok:
+                continue
+            f = min(ok, key=lambda s: (abs(min(s["width"], s["height"]) - 1080), s["width"] * s["height"]))
+            out.append({"id": f"xv{v['id']}", "kind": "video", "url": f["url"], "page": v.get("pageURL"), "author": v.get("user"),
+                        "author_url": _pixabay_user_url(v), "width": f["width"], "height": f["height"],
+                        "duration": float(v.get("duration") or 0)})
+        # Pixabay has no orientation filter for videos: clips that match the format come first
+        out.sort(key=lambda c: (c["height"] >= c["width"]) != portrait)
+    else:
+        data = _pixabay_get("api/", {"q": query[:100], "image_type": "photo", "per_page": 20, "safesearch": "true",
+                                     "orientation": "vertical" if portrait else "horizontal"})
+        for ph in data.get("hits", []):
+            url = ph.get("fullHDURL") or ph.get("largeImageURL")
+            if url:
+                out.append({"id": f"xp{ph['id']}", "kind": "image", "url": url, "page": ph.get("pageURL"), "author": ph.get("user"),
+                            "author_url": _pixabay_user_url(ph), "width": ph.get("imageWidth"), "height": ph.get("imageHeight"),
+                            "duration": 0.0})
+    return out
+
+
+def stock_search(kind: str, query: str, orient: str) -> list[dict]:
+    """Candidates from every configured provider (Pexels first, then Pixabay), each tagged with its provider."""
+    provs = stock_providers()
+    out = []
+    for prov in provs:
+        fn = _pexels_search if prov == "pexels" else _pixabay_search
+        try:
+            out += [{**c, "provider": c.get("provider", prov)} for c in fn(kind, query, orient)]
+        except AssetError as exc:
+            if len(provs) == 1:
+                raise
+            log.warning("%s search failed, using the other provider: %s", prov, exc)
+    return out
+
+
 def queries_for(shot: dict) -> list[str]:
     """Most specific first, then broader fallbacks."""
     qs = [q.strip() for q in shot.get("search_keywords", []) if q and q.strip()]
@@ -172,10 +269,10 @@ def queries_for(shot: dict) -> list[str]:
 
 
 def pick_stock(p: StudioProject, shot: dict, kind: str, used: set[str], skip: set[str] = frozenset()) -> dict | None:
-    """First good Pexels candidate not used elsewhere in this project. Videos must cover the shot's length."""
+    """First good stock candidate not used elsewhere in this project. Videos must cover the shot's length."""
     need = float(shot.get("seconds") or 2) + 0.3
     for q in queries_for(shot):
-        cands = [c for c in _pexels_search(kind, q, orientation(p)) if c["id"] not in used and c["id"] not in skip and c.get("url")]
+        cands = [c for c in stock_search(kind, q, orientation(p)) if c["id"] not in used and c["id"] not in skip and c.get("url")]
         if kind == "video":
             long_enough = [c for c in cands if c["duration"] >= need]
             cands = long_enough or cands
@@ -185,21 +282,23 @@ def pick_stock(p: StudioProject, shot: dict, kind: str, used: set[str], skip: se
 
 
 def fetch_stock(p: StudioProject, shot: dict, kind: str, used: set[str], dest_stem: Path, skip: set[str] = frozenset()) -> dict:
-    """Returns asset fields for a Pexels result, or raises AssetError("missing: ...")."""
-    if not pexels_key() and pexels_hook is None:
-        raise AssetError("missing: No Pexels key. Add PEXELS_API_KEY to backend/.env (free), upload your own, or use an AI image.")
+    """Returns asset fields for a stock result, or raises AssetError("missing: ...")."""
+    if not stock_providers():
+        raise AssetError("missing: No stock key. Add PIXABAY_API_KEY (or PEXELS_API_KEY) to backend/.env (free), "
+                         "upload your own, or use an AI image.")
     c = pick_stock(p, shot, kind, used, skip)
     if c is None:
-        raise AssetError("missing: Pexels found nothing for these keywords. Upload your own, edit the keywords, or use an AI image.")
+        raise AssetError("missing: No stock results for these keywords. Upload your own, edit the keywords, or use an AI image.")
     ext = ".mp4" if kind == "video" else ".jpg"
     path = dest_stem.with_suffix(ext)
     _download(c["url"], path)
     used.add(c["id"])
     thumb = _thumb(path, dest_stem.with_name(dest_stem.name + "_thumb.jpg"), 0.5 if kind == "video" else 0)
-    return {"kind": kind, "origin": "pexels", "local_path": str(path), "preview_path": str(thumb) if thumb else None,
-            "source_url": c.get("page"), "license": PEXELS_LICENSE,
-            "attribution": f"{'Video' if kind == 'video' else 'Photo'} by {c.get('author') or 'unknown'} on Pexels",
-            "meta": {"pexels_id": c["id"], "query": c["query"], "width": c.get("width"), "height": c.get("height"),
+    prov = c.get("provider", "pexels")
+    return {"kind": kind, "origin": prov, "local_path": str(path), "preview_path": str(thumb) if thumb else None,
+            "source_url": c.get("page"), "license": LICENSES[prov],
+            "attribution": f"{'Video' if kind == 'video' else 'Photo'} by {c.get('author') or 'unknown'} on {prov.capitalize()}",
+            "meta": {"stock_id": c["id"], "provider": prov, "query": c["query"], "width": c.get("width"), "height": c.get("height"),
                      "duration": c.get("duration"), "author_url": c.get("author_url")}}
 
 
@@ -357,8 +456,8 @@ def _used_ids(project_id: int, exclude: tuple[str, int] | None = None) -> tuple[
             if exclude and (a.scene_id, a.shot_index) == exclude:
                 continue
             m = json.loads(a.meta_json or "{}")
-            if m.get("pexels_id"):
-                used.add(m["pexels_id"])
+            if stock_id(m):
+                used.add(stock_id(m))
             if a.origin == "library" and "start" in m:
                 ranges.append((a.local_path, m["start"]))
     return used, ranges
@@ -420,7 +519,7 @@ def _run_stage(project_id: int, report) -> None:
             _save(project_id, sid, i, {"kind": "none", "origin": "none"}, spec,
                   status="missing" if missing else "failed", note=msg.removeprefix("missing: "))
 
-    # quick, sequential sources first (keeps Pexels de-duplication simple), AI images in parallel after
+    # quick, sequential sources first (keeps stock de-duplication simple), AI images in parallel after
     ai_jobs = []
     for sid, i, shot, spec in todo:
         if shot["visual_type"] == "ai_image":
@@ -473,6 +572,7 @@ def overview(project_id: int) -> dict:
                           "seconds": sh.get("seconds"), "graphic": sh.get("graphic"), "asset": a, "stale": stale, "state": state})
         scenes.append({"scene_id": sc["scene_id"], "narration": sc["narration"], "shots": shots})
     return {"scenes": scenes, "counts": counts, "plan": plan, "pexels_key_present": bool(pexels_key()),
+            "stock_providers": stock_providers(),
             "library_videos": len(library_videos()), "image_model": ss.IMAGE_MODEL, "image_quality": IMAGE_QUALITY,
             "credits": credits(project_id)}
 
@@ -489,7 +589,8 @@ def credits(project_id: int) -> list[str]:
     """Lines for the video description (step 9)."""
     out = []
     with session_scope() as s:
-        for a in s.query(StudioAsset).filter_by(project_id=project_id, origin="pexels", status="ready").all():
+        for a in s.query(StudioAsset).filter(StudioAsset.project_id == project_id, StudioAsset.origin.in_(STOCK_ORIGINS),
+                                             StudioAsset.status == "ready").all():
             line = f"{a.attribution}: {a.source_url}"
             if line not in out:
                 out.append(line)
@@ -515,7 +616,7 @@ def _shot(board: dict, scene_id: str, idx: int) -> dict:
 
 
 def replace(project_id: int, scene_id: str, idx: int, action: str) -> dict:
-    """action: next (another Pexels/library result) | ai_image | stock_video | stock_image | library | graphic"""
+    """action: next (another stock/library result) | ai_image | stock_video | stock_image | library | graphic"""
     p, board = _load(project_id)
     shot = _shot(board, scene_id, idx)
     spec = spec_key(shot, p, board)
@@ -525,13 +626,14 @@ def replace(project_id: int, scene_id: str, idx: int, action: str) -> dict:
         cur = s.query(StudioAsset).filter_by(project_id=project_id, scene_id=scene_id, shot_index=idx).first()
         cur_meta = json.loads(cur.meta_json or "{}") if cur else {}
         cur_origin = cur.origin if cur else None
+        cur_kind = cur.kind if cur else None
     if action == "next":
-        skip = set(cur_meta.get("tried", [])) | ({cur_meta["pexels_id"]} if cur_meta.get("pexels_id") else set())
+        skip = set(cur_meta.get("tried", [])) | ({stock_id(cur_meta)} if stock_id(cur_meta) else set())
         if cur_origin == "library":
             mode = "gameplay"
             ranges.append((cur.local_path, cur_meta.get("start", 0)))     # pick a different moment
-        elif cur_origin == "pexels":
-            mode = "stock_video" if cur_meta["pexels_id"].startswith("v") else "stock_image"
+        elif cur_origin in STOCK_ORIGINS:
+            mode = "stock_video" if cur_kind == "video" else "stock_image"
         elif shot["visual_type"] in ("stock_video", "stock_image", "gameplay", "user_footage"):
             mode = shot["visual_type"]
         else:

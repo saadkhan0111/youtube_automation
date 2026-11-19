@@ -235,6 +235,15 @@ function StudioProject({ id, opts }) {
           {stage.key === "assets" && ["ready", "review", "approved", "failed"].includes(stage.status) && (
             <AssetsPanel id={id} hasResult={stage.status !== "ready"} onChanged={load} />
           )}
+          {stage.key === "render" && ["ready", "review", "approved", "failed"].includes(stage.status) && (
+            <RenderPanel id={id} hasResult={stage.status !== "ready"} />
+          )}
+          {stage.key === "qa" && ["ready", "review", "approved", "failed"].includes(stage.status) && (
+            <QAPanel id={id} hasResult={stage.status !== "ready"} goTo={setView} onChanged={load} />
+          )}
+          {stage.key === "package" && ["ready", "review", "approved", "failed"].includes(stage.status) && (
+            <PackagePanel id={id} hasResult={stage.status !== "ready"} approved={stage.status === "approved"} />
+          )}
         </section>
         <aside>
           <section className="card">
@@ -776,7 +785,7 @@ function VoicePanel({ id, hasResult, onChanged }) {
 }
 
 // ------------------------------------------------------------------ assets
-const ORIGIN_LABEL = { pexels: "Pexels", ai: "AI image", library: "Your library", upload: "Your upload", graphic: "Graphic", none: "—" };
+const ORIGIN_LABEL = { pexels: "Pexels", pixabay: "Pixabay", ai: "AI image", library: "Your library", upload: "Your upload", graphic: "Graphic", none: "—" };
 
 function AssetsPanel({ id, hasResult, onChanged }) {
   const [o, setO] = useState(null);
@@ -810,10 +819,10 @@ function AssetsPanel({ id, hasResult, onChanged }) {
     <div className="assets">
       {!hasResult && (
         <div className="muted small">
-          <p>Assets finds or makes one visual per shot: <b>{pl.stock}</b> stock (Pexels{o.pexels_key_present ? "" : ", no key yet"}),
+          <p>Assets finds or makes one visual per shot: <b>{pl.stock}</b> stock ({o.stock_providers.length ? o.stock_providers.map((x) => ORIGIN_LABEL[x]).join(" + ") : "no stock key yet"}),
             {" "}<b>{pl.ai_image}</b> AI illustrations ({o.image_model}, {o.image_quality} quality), <b>{pl.library}</b> from your own footage
             {" "}({o.library_videos} video{o.library_videos === 1 ? "" : "s"} in your library), <b>{pl.graphic}</b> graphics drawn at render time.</p>
-          {!o.pexels_key_present && pl.stock > 0 && <div className="warnmsg">⚠ No Pexels key: stock shots will be marked missing. Get a free key at pexels.com/api and add <code>PEXELS_API_KEY=...</code> to backend/.env, then restart. You can also upload your own or fill gaps with AI images afterwards.</div>}
+          {!o.stock_providers.length && pl.stock > 0 && <div className="warnmsg">⚠ No stock key: stock shots will be marked missing. Get a free key at pixabay.com/api/docs (sign up, the key is shown on that page) and add <code>PIXABAY_API_KEY=...</code> to backend/.env, then restart. You can also upload your own or fill gaps with AI images afterwards.</div>}
         </div>
       )}
       {hasResult && (
@@ -876,13 +885,227 @@ function ShotAsset({ id, sid, sh, busy, disabled, onReplace, onUpload, onOpen })
       {sh.stale && <div className="tiny-text warn-text">Shot changed. Run Assets again.</div>}
       {sh.visual_type !== "graphic" && (
         <div className="row wrap">
-          {a && ["pexels", "library"].includes(a.origin) && <button className="tiny" disabled={disabled} onClick={() => onReplace(sid, sh.index, "next")}>↻ Next</button>}
-          {!(a && a.origin === "pexels") && sh.visual_type.startsWith("stock") && <button className="tiny" disabled={disabled} onClick={() => onReplace(sid, sh.index, sh.visual_type)}>Pexels</button>}
+          {a && ["pexels", "pixabay", "library"].includes(a.origin) && <button className="tiny" disabled={disabled} onClick={() => onReplace(sid, sh.index, "next")}>↻ Next</button>}
+          {!(a && ["pexels", "pixabay"].includes(a.origin)) && sh.visual_type.startsWith("stock") && <button className="tiny" disabled={disabled} onClick={() => onReplace(sid, sh.index, sh.visual_type)}>Stock</button>}
           <button className="tiny" disabled={disabled} onClick={() => onReplace(sid, sh.index, "ai_image")}>{busy ? "…" : a && a.origin === "ai" ? "↻ New image" : "✨ AI"}</button>
           <button className="tiny" disabled={disabled} onClick={() => fileRef.current.click()}>⬆ Upload</button>
           <input ref={fileRef} type="file" accept="video/*,image/*" hidden onChange={(e) => e.target.files[0] && onUpload(sid, sh.index, e.target.files[0])} />
         </div>
       )}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ rendering
+function RenderPanel({ id, hasResult }) {
+  const [r, setR] = useState(null);
+  const [err, setErr] = useState("");
+  useEffect(() => { api.get(`/api/studio/projects/${id}/render`).then(setR).catch((e) => setErr(e.message)); }, [id, hasResult]);
+  if (err) return <div className="error small">{err}</div>;
+  if (!r) return null;
+  const s = r.summary;
+  const musicNote = r.music_local_tracks > 0 ? `${r.music_local_tracks} track(s) of your own for “${r.music_mood}”`
+    : r.jamendo_key_present ? `Jamendo (CC BY / CC BY-SA only) for “${r.music_mood}”` : null;
+  return (
+    <div className="render">
+      {!s && (
+        <div className="muted small">
+          <p>Rendering builds the video: every shot with its camera move and effects, transitions, word-by-word captions,
+            graphics, narration, music ducked under the voice and sound effects. A Short takes about 1–3 minutes.</p>
+          <div className={musicNote ? "small" : "warnmsg"}>
+            {musicNote ? <>♪ Music: {musicNote}.</> : <>⚠ No music source yet. Put .mp3 files in <code>{r.music_folder}</code>,
+              or add a free <code>JAMENDO_CLIENT_ID</code> (devportal.jamendo.com) to backend/.env and restart. Without one the video renders without music.</>}
+          </div>
+        </div>
+      )}
+      {s && (
+        <div className="render-result">
+          <video key={s.render_id} className={s.width < s.height ? "vertical" : "horizontal"} controls preload="metadata"
+            poster={`/api/studio/projects/${id}/renders/${s.render_id}/poster`}
+            src={`/api/studio/projects/${id}/renders/${s.render_id}/video`} />
+          <div className="render-info small">
+            <div><b>Version {s.version}</b> · {s.duration}s · {s.width}×{s.height} · {s.size_mb} MB</div>
+            <div>{s.shots} shots ({s.segments_reused} reused from the last render) · {s.sfx} sound effects</div>
+            <div>Captions: {s.caption_style.replaceAll("_", " ")} · transitions: {s.transitions.join(", ")}{s.avatar ? " · avatar presenter" : ""}</div>
+            <div>{s.music ? <>♪ {s.music.title}{s.music.artist ? ` by ${s.music.artist}` : ""} ({s.music.source}{s.music.license ? `, ${s.music.license.split(":")[0]}` : ""})</> : "♪ No music"}</div>
+            {s.music && s.music.credit && <div className="muted tiny-text">Credit for the description: {s.music.credit}</div>}
+            {s.warnings.map((w, i) => <div key={i} className="warnmsg">⚠ {w}</div>)}
+            <a href={`/api/studio/projects/${id}/renders/${s.render_id}/video`} download>⬇ Download MP4</a>
+            {r.renders.length > 1 && (
+              <details><summary>Earlier renders ({r.renders.length - 1})</summary>
+                <ul>{r.renders.slice(1).map((x) => <li key={x.id}>{x.status === "done"
+                  ? <a href={`/api/studio/projects/${id}/renders/${x.id}/video`} target="_blank" rel="noreferrer">#{x.id} · {x.aspect}</a>
+                  : <>#{x.id} · {x.status}{x.error ? `: ${x.error.slice(0, 120)}` : ""}</>} <span className="muted">{x.created_at}</span></li>)}</ul>
+              </details>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ quality check
+const QA_ICON = { pass: "✓", info: "i", warn: "!", fail: "✕", dismissed: "–" };
+const QA_ORDER = ["fail", "warn", "info", "dismissed", "pass"];
+const QA_HARD = new Set(["format", "sync", "length", "script_facts"]);
+const QA_GROUPS = [["technical", "Technical"], ["content", "Content & facts"], ["visual", "Frames (AI review)"]];
+const STAGE_NAME = { research: "Research", script: "Script", storyboard: "Storyboard", voice: "Voiceover", assets: "Assets", render: "Rendering" };
+
+function QAPanel({ id, hasResult, goTo, onChanged }) {
+  const [d, setD] = useState(null);
+  const [err, setErr] = useState("");
+  const [big, setBig] = useState(null);
+  const [busy, setBusy] = useState("");
+  const dismiss = async (x, undo) => {
+    const note = undo ? "" : window.prompt(`Dismiss “${x.label}”? Add a short note (e.g. "checked, text is correct"):`, "Checked: looks fine");
+    if (note === null) return;
+    setBusy(x.id);
+    try { setD(await api.post(`/api/studio/projects/${id}/qa/checks/${x.id}/dismiss`, { note, undo })); onChanged && onChanged(); }
+    catch (e) { setErr(e.message); }
+    setBusy("");
+  };
+  useEffect(() => { api.get(`/api/studio/projects/${id}/qa`).then(setD).catch((e) => setErr(e.message)); }, [id, hasResult]);
+  if (err) return <div className="error small">{err}</div>;
+  if (!d) return null;
+  const r = d.result;
+  if (!r) return (
+    <p className="muted small">
+      The quality check inspects the finished render: format and length, loudness and clipping, dead air, black or frozen
+      picture, open script/fact warnings, credits, and one frame per shot reviewed by {d.model} for misspelled or unwanted
+      text, real-person likeness, logos, caption problems and glitches. Takes about a minute; the frame review costs a few cents.
+    </p>
+  );
+  const c = r.counts;
+  return (
+    <div className="qa">
+      <div className={`qa-banner ${r.passed ? "ok" : "bad"}`}>
+        {r.passed ? "✓ Ready to publish" : `✕ ${c.fail} problem${c.fail > 1 ? "s" : ""} must be fixed before approval`}
+        <span className="small"> · {c.pass} passed · {c.warn} warning{c.warn === 1 ? "" : "s"} · {c.info} note{c.info === 1 ? "" : "s"}{c.dismissed ? ` · ${c.dismissed} dismissed` : ""}</span>
+      </div>
+      {QA_GROUPS.map(([g, label]) => {
+        const rows = r.checks.filter((x) => x.group === g);
+        if (!rows.length) return null;
+        return (
+          <div key={g} className="qa-group">
+            <div className="qa-group-title">{label}</div>
+            {rows.sort((a, b) => QA_ORDER.indexOf(a.status) - QA_ORDER.indexOf(b.status)).map((x) => (
+              <div key={x.id} className={`qa-row ${x.status}`}>
+                <span className="qa-icon">{QA_ICON[x.status]}</span>
+                <div className="qa-body">
+                  <b>{x.label}</b> <span className="small">{x.detail}</span>
+                  {x.status === "dismissed" && <div className="tiny-text muted">Dismissed (was {x.status_before}): {x.dismissed_note}</div>}
+                  {x.frames && x.frames.length > 0 && (
+                    <div className="qa-frames">{[...new Set(x.frames)].slice(0, 6).map((f) => (
+                      <img key={f} src={`/api/studio/projects/${id}/qa/frames/${f}`} alt="" onClick={() => setBig(f)} />))}</div>
+                  )}
+                </div>
+                {x.fix && !["pass", "dismissed"].includes(x.status) && <button className="tiny" onClick={() => goTo(x.fix)}>Fix in {STAGE_NAME[x.fix] || x.fix} →</button>}
+                {["warn", "fail"].includes(x.status) && !(QA_HARD.has(x.id) && x.status === "fail") && <button className="tiny ghost" disabled={busy === x.id} onClick={() => dismiss(x, false)}>Dismiss</button>}
+                {x.status === "dismissed" && <button className="tiny ghost" disabled={busy === x.id} onClick={() => dismiss(x, true)}>Undo</button>}
+              </div>
+            ))}
+          </div>
+        );
+      })}
+      <div className="muted tiny-text">Checked render #{r.render_id}. After fixing, render again and re-run this check.</div>
+      {big && <div className="modal-back" onClick={() => setBig(null)}><img className="qa-big" src={`/api/studio/projects/${id}/qa/frames/${big}`} alt="" /></div>}
+    </div>
+  );
+}
+
+// ------------------------------------------------------------------ package
+function PackagePanel({ id, hasResult, approved }) {
+  const [pk, setPk] = useState(null);
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState("");
+  const [form, setForm] = useState(null);
+  const [thumbText, setThumbText] = useState({});
+  const sync = (p) => {
+    setPk(p);
+    if (p) setForm({ title: p.title, intro: p.intro, hashtags: p.hashtags.join(" "), tags: p.tags.join(", "), pinned_comment: p.pinned_comment });
+  };
+  useEffect(() => { api.get(`/api/studio/projects/${id}/package`).then((d) => sync(d.package)).catch((e) => setErr(e.message)); }, [id, hasResult, approved]);
+  if (err && !pk) return <div className="error small">{err}</div>;
+  if (!pk) return (
+    <p className="muted small">
+      Package writes 5 title options (checked against your facts), hashtags, tags and a pinned comment, builds the description
+      from your sources and credits (sources and credits are added by the app, never invented), and makes 3 thumbnails from
+      your best images. Approving it sends the video to the Videos queue for the normal review and schedule. Costs about a cent.
+    </p>
+  );
+  const locked = !!pk.handoff;
+  const save = async (extra = {}) => {
+    setBusy("save"); setErr("");
+    try {
+      const d = await api.patch(`/api/studio/projects/${id}/package`, {
+        title: form.title, intro: form.intro, pinned_comment: form.pinned_comment,
+        hashtags: form.hashtags.split(/[\s,]+/).filter(Boolean), tags: form.tags.split(",").map((x) => x.trim()).filter(Boolean), ...extra,
+      });
+      sync(d.package);
+    } catch (e) { setErr(e.message); }
+    setBusy("");
+  };
+  const remake = async (i) => {
+    setBusy(`t${i}`); setErr("");
+    try { const d = await api.post(`/api/studio/projects/${id}/package/thumbnails/${i}`, { text: thumbText[i] }); sync(d.package); }
+    catch (e) { setErr(e.message); }
+    setBusy("");
+  };
+  const set = (k) => (e) => setForm({ ...form, [k]: e.target.value });
+  return (
+    <div className="package">
+      {locked && (
+        <div className="qa-banner ok">✓ Sent to the publishing queue as <a href={`#/videos?status=pending_review&id=${pk.handoff.video_id}`}>video #{pk.handoff.video_id}</a>.
+          <span className="small"> Review, schedule and upload it from Videos as usual.</span></div>
+      )}
+      {err && <div className="error small">{err}</div>}
+      <div className="field"><label>Title</label>
+        <input value={form.title} maxLength={100} disabled={locked} onChange={set("title")} />
+        <div className="small muted">{form.title.length}/100 · keep it under 70 for phones</div>
+      </div>
+      {!locked && (
+        <div className="title-options">
+          {pk.titles.map((t) => (
+            <label key={t.title} className={`title-opt ${form.title === t.title ? "on" : ""}`}>
+              <input type="radio" checked={form.title === t.title} onChange={() => setForm({ ...form, title: t.title })} />
+              <span>{t.title} <span className="muted tiny-text">({t.angle})</span>
+                {t.warnings.map((w, i) => <span key={i} className="pill warn">{w}</span>)}</span>
+            </label>
+          ))}
+        </div>
+      )}
+      <div className="field"><label>Thumbnail</label>
+        <div className="thumb-grid">
+          {pk.thumbnails.map((t, i) => (
+            <div key={t.file} className={`thumb-opt ${pk.thumbnail === t.file ? "on" : ""}`}>
+              <img src={`/api/studio/projects/${id}/package/files/${t.file}`} alt="" onClick={() => !locked && save({ thumbnail: t.file })} />
+              {!locked && <div className="row">
+                <input placeholder={t.text} value={thumbText[i] ?? ""} maxLength={40} onChange={(e) => setThumbText({ ...thumbText, [i]: e.target.value })} />
+                <button className="tiny" disabled={!thumbText[i] || busy === `t${i}`} onClick={() => remake(i)}>{busy === `t${i}` ? "…" : "↻"}</button>
+              </div>}
+              <a className="tiny-text" href={`/api/studio/projects/${id}/package/files/${t.file}`} download>⬇ download</a>
+            </div>
+          ))}
+        </div>
+        <div className="small muted">Click a thumbnail to choose it. YouTube doesn't reliably apply custom thumbnails to Shorts (it uses a frame
+          you pick in the YouTube app); for Shorts this is mainly for sharing. Uploading thumbnails automatically is not built yet.</div>
+      </div>
+      <div className="field"><label>Description intro</label>
+        <textarea rows={3} value={form.intro} disabled={locked} onChange={set("intro")} />
+      </div>
+      <details className="small" open>
+        <summary>Full description preview (sources, credits and hashtags are added automatically)</summary>
+        <pre className="desc-preview">{pk.description}</pre>
+      </details>
+      <div className="grid2">
+        <div className="field"><label>Hashtags</label><input value={form.hashtags} disabled={locked} onChange={set("hashtags")} /></div>
+        <div className="field"><label>Tags (comma separated)</label><input value={form.tags} disabled={locked} onChange={set("tags")} /></div>
+      </div>
+      <div className="field"><label>Pinned comment (post it yourself after publishing)</label>
+        <input value={form.pinned_comment} disabled={locked} onChange={set("pinned_comment")} /></div>
+      {!locked && <div className="row"><button className="primary" disabled={busy === "save"} onClick={() => save()}>{busy === "save" ? "Saving…" : "Save changes"}</button>
+        <span className="small muted">Then Approve to send it to the Videos queue.</span></div>}
     </div>
   );
 }

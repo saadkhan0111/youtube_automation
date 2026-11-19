@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import Literal
@@ -16,7 +17,7 @@ from sqlalchemy.orm import Session
 from ..db import get_db
 from ..events import record_event
 from ..serializers import iso
-from ..studio import assets, costs, narration, research, script, stages, storyboard, styles, worker  # importing registers the stage handlers
+from ..studio import assets, costs, editor, narration, package, qa, research, script, stages, storyboard, styles, worker  # importing registers the stage handlers
 from ..studio import settings as ss
 from ..studio.models import StudioProject
 
@@ -196,6 +197,19 @@ def approve_stage(pid: int, stage: str, db: Session = DBDep):
         problems = assets.blocking_problems(pid)
         if problems:
             raise HTTPException(400, " ".join(problems))
+    if stage == "qa" and stages.status(p, stage) == stages.REVIEW:
+        problems = qa.blocking(pid)
+        if problems:
+            raise HTTPException(400, "Fix these first: " + " | ".join(problems))
+    handed = None
+    if stage == "package" and stages.status(p, stage) == stages.REVIEW:
+        db.commit()
+        try:
+            handed = package.handoff(pid)          # into the Videos queue (pending review); idempotent
+        except package.PackageError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        db.expire_all()
+        p = _project(db, pid)
     try:
         stages.approve(p, stage)
     except stages.StageError as exc:
@@ -581,3 +595,133 @@ def fill_missing(pid: int, db: Session = DBDep):
     worker.enqueue(pid, "assets")
     db.expire_all()
     return project_dict(_project(db, pid), full=True)
+
+
+# ------------------------------------------------------------------ render
+@router.get("/projects/{pid}/render")
+def get_render(pid: int, db: Session = DBDep):
+    from ..studio import music as music_mod
+    from ..studio.models import StudioRender
+
+    p = _project(db, pid)
+    outputs = json.loads(p.outputs_json or "{}")
+    rows = db.query(StudioRender).filter_by(project_id=pid).order_by(StudioRender.id.desc()).all()
+    mood = json.loads(p.storyboard_json)["overall"].get("music_mood") if p.storyboard_json else None
+    return {"summary": outputs.get("render"),
+            "renders": [{"id": r.id, "aspect": r.aspect, "status": r.status, "error": r.error, "created_at": iso(r.created_at)}
+                        for r in rows],
+            "music_mood": mood, "music_local_tracks": len(music_mod.local_tracks(mood)) if mood else 0,
+            "music_folder": str(music_mod.music_root() / (mood or "")), "jamendo_key_present": bool(music_mod.jamendo_key())}
+
+
+@router.get("/projects/{pid}/renders/{rid}/{what}")
+def render_file(pid: int, rid: int, what: Literal["video", "poster"], db: Session = DBDep):
+    from ..studio.models import StudioRender
+
+    r = db.get(StudioRender, rid)
+    if r is None or r.project_id != pid or r.status != "done" or not r.file_path:
+        raise HTTPException(404, "Render not found")
+    path = Path(r.file_path)
+    if what == "poster":
+        path = path.with_name(path.name.split("_")[0] + "_poster.jpg")
+    path = path.resolve()
+    if ss.project_dir(pid).resolve() not in path.parents or not path.is_file():
+        raise HTTPException(404, "File missing")
+    return FileResponse(path, media_type="video/mp4" if what == "video" else "image/jpeg")
+
+
+# ------------------------------------------------------------------ quality check
+@router.get("/projects/{pid}/qa")
+def get_qa(pid: int, db: Session = DBDep):
+    _project(db, pid)
+    return {"result": qa.result(pid), "model": ss.QA_MODEL}
+
+
+@router.get("/projects/{pid}/qa/frames/{name}")
+def qa_frame(pid: int, name: str, db: Session = DBDep):
+    _project(db, pid)
+    if not name.endswith(".jpg") or "/" in name or "\\" in name or ".." in name:
+        raise HTTPException(404, "Not found")
+    path = ss.project_dir(pid) / "qa" / "frames" / name
+    if not path.is_file():
+        raise HTTPException(404, "Not found")
+    return FileResponse(path, media_type="image/jpeg")
+
+
+class DismissIn(BaseModel):
+    note: str = ""
+    undo: bool = False
+
+
+@router.post("/projects/{pid}/qa/checks/{check_id}/dismiss")
+def dismiss_qa(pid: int, check_id: str, body: DismissIn, db: Session = DBDep):
+    p = _project(db, pid)
+    _not_running(p, "qa")
+    try:
+        res = qa.dismiss(pid, check_id, body.note, body.undo)
+    except qa.QAError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    db.expire_all()
+    p = _project(db, pid)
+    if stages.status(p, "qa") == stages.APPROVED:
+        stages.reopen(p, "qa")
+    return {"result": res, "model": ss.QA_MODEL}
+
+
+# ------------------------------------------------------------------ package
+@router.get("/projects/{pid}/package")
+def get_package(pid: int, db: Session = DBDep):
+    _project(db, pid)
+    return {"package": package.get(pid)}
+
+
+class PackageIn(BaseModel):
+    title: str | None = Field(None, max_length=100)
+    intro: str | None = Field(None, max_length=3000)
+    hashtags: list[str] | None = None
+    tags: list[str] | None = None
+    pinned_comment: str | None = Field(None, max_length=500)
+    thumbnail: str | None = None
+
+
+def _package_edit(p: StudioProject) -> None:
+    _not_running(p, "package")
+    if stages.status(p, "package") not in (stages.REVIEW, stages.APPROVED):
+        raise HTTPException(400, "Run Package first.")
+    if (package.get(p.id) or {}).get("handoff"):
+        raise HTTPException(400, "Already sent to the Videos queue: edit the title/description there.")
+
+
+@router.patch("/projects/{pid}/package")
+def patch_package(pid: int, body: PackageIn, db: Session = DBDep):
+    p = _project(db, pid)
+    _package_edit(p)
+    try:
+        return {"package": package.update(pid, **body.model_dump(exclude_none=True))}
+    except package.PackageError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+class ThumbIn(BaseModel):
+    text: str = Field(min_length=1, max_length=40)
+
+
+@router.post("/projects/{pid}/package/thumbnails/{index}")
+def remake_thumb(pid: int, index: int, body: ThumbIn, db: Session = DBDep):
+    p = _project(db, pid)
+    _package_edit(p)
+    try:
+        return {"package": package.remake_thumbnail(pid, index, body.text)}
+    except package.PackageError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@router.get("/projects/{pid}/package/files/{name}")
+def package_file(pid: int, name: str, db: Session = DBDep):
+    _project(db, pid)
+    if not re.fullmatch(r"thumb_[\w-]+\.jpg", name):
+        raise HTTPException(404, "Not found")
+    path = ss.project_dir(pid) / "package" / name
+    if not path.is_file():
+        raise HTTPException(404, "Not found")
+    return FileResponse(path, media_type="image/jpeg", filename=name)

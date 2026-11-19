@@ -194,21 +194,20 @@ def graphic_events(shot: Shot, lay: dict) -> list[str]:
     out = []
     pop = r"\fscx40\fscy40\t(0,140,\fscx112\fscy112)\t(140,240,\fscx100\fscy100)\fad(60,120)"
     if kind in ("text_punch", "number_reveal", "stat_callout", "ranking_card"):
+        # one event, main text + subtitle on its own line: libass lays out the lines, so they can never overlap
         size = int(_big_size(text, 230 if kind != "text_punch" else 200) * s)
         color = ACCENT if kind != "text_punch" else WHITE
         rot = r"\frz-3" if kind == "text_punch" else ""
-        out.append(f"Dialogue: 5,{st},{en},Big,,0,0,0,,{{\\pos({x},{y})\\fs{size}{color}{rot}{pop}}}{text}")
-        if sub:
-            out.append(f"Dialogue: 5,{cap.ts(secs(shot.start) + 0.18)},{en},Sub,,0,0,0,,"
-                       f"{{\\pos({x},{y + int(size * 0.75)})\\fad(120,120)\\fs{int(_big_size(sub, 76) * s)}}}{sub.upper()}")
+        subline = rf"\N{{\fs{int(max(60, _big_size(sub, 88)) * s)}\c&HFFFFFF&\bord{max(1, int(6 * s))}}}{sub.upper()}" if sub else ""
+        out.append(rf"Dialogue: 5,{st},{en},Big,,0,0,0,,{{\an5\pos({x},{y})\fs{size}{color}{rot}{pop}}}{text}{subline}")
     elif kind == "quote_card":
-        out.append(f"Dialogue: 5,{st},{en},Card,,0,0,0,,{{\\pos({x},{y})\\i1\\fs{int(64 * s)}\\fad(150,150)}}“{text}”"
-                   + (f"\\N{{\\i0\\fs{int(44 * s)}{ACCENT}}}— {sub}" if sub else ""))
+        out.append(rf"Dialogue: 5,{st},{en},Card,,0,0,0,,{{\an5\pos({x},{y})\i1\fs{int(max(66, _big_size(text, 92)) * s)}\fad(150,150)}}“{text}”"
+                   + (rf"\N{{\i0\fs{int(50 * s)}{ACCENT}}}— {sub}" if sub else ""))
     else:  # title_card, comparison, timeline, map_pin
         prefix = "▼ " if kind == "map_pin" else ""
-        out.append(f"Dialogue: 5,{st},{en},Card,,0,0,0,,{{\\pos({x},{y})\\fs{int(_big_size(text, 96) * s)}{pop}}}"
-                   f"{prefix}{text}"
-                   + (f"\\N{{\\fs{int(50 * s)}{ACCENT}}}{sub}" if sub else ""))
+        out.append(rf"Dialogue: 5,{st},{en},Card,,0,0,0,,{{\an5\pos({x},{y})\fs{int(max(72, _big_size(text, 130)) * s)}{pop}}}"
+                   rf"{prefix}{text}"
+                   + (rf"\N{{\fs{int(54 * s)}{ACCENT}}}{sub}" if sub else ""))
     return out
 
 
@@ -223,7 +222,7 @@ def kicker_events(sc: Scene, lay: dict, avatar: bool) -> list[str]:
     if end - start < 0.6:
         return []
     y = lay["kicker_y"] + (300 if avatar and lay["w"] < lay["h"] else 0)
-    size = int((60 if len(text) <= 26 else 48) * lay["scale"])
+    size = int((72 if len(text) <= 24 else 60 if len(text) <= 36 else 52) * lay["scale"])
     return [f"Dialogue: 4,{cap.ts(start)},{cap.ts(end)},Kicker,,0,0,0,,"
             f"{{\\pos({lay['w'] // 2},{y})\\fs{size}\\fad(120,150)\\fscx80\\fscy80\\t(0,120,\\fscx100\\fscy100)}}{text.upper()}"]
 
