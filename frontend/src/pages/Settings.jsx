@@ -35,6 +35,19 @@ export default function Settings({ params, auth, reloadAuth }) {
 
   const save = (patch) => act(async () => { const d = await api.put("/api/settings", patch); setS(d); setTimes(d.publishing_times.join(", ")); }, "Settings saved.");
 
+  // n publishing times evenly between 09:00 and 23:30 local time, rounded to 5 minutes
+  const spreadTimes = (n) => {
+    const start = 9 * 60, end = 23 * 60 + 30;
+    const step = n > 1 ? (end - start) / (n - 1) : 0;
+    const out = [];
+    for (let i = 0; i < n; i++) {
+      const m = Math.round((start + step * i) / 5) * 5;
+      const hhmm = `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
+      if (!out.includes(hhmm)) out.push(hhmm);
+    }
+    return out.join(", ");
+  };
+
   if (!s) return <div className="muted">Loading…</div>;
   const num = (k) => (e) => setS({ ...s, [k]: Number(e.target.value) });
 
@@ -79,9 +92,22 @@ export default function Settings({ params, auth, reloadAuth }) {
           <label>Timezone</label>
           <input value={s.timezone} onChange={(e) => setS({ ...s, timezone: e.target.value })} />
           <label>Daily publishing limit</label>
-          <input type="number" min={1} max={20} value={s.daily_upload_limit} onChange={num("daily_upload_limit")} />
+          <input type="number" min={1} max={50} value={s.daily_upload_limit} onChange={num("daily_upload_limit")} />
           <label>Publishing times (HH:MM)</label>
-          <input value={times} onChange={(e) => setTimes(e.target.value)} placeholder="13:00, 18:00, 21:00" />
+          <div>
+            <input value={times} onChange={(e) => setTimes(e.target.value)} placeholder="13:00, 18:00, 21:00" />
+            {(() => {
+              const n = times.split(/[,\s]+/).filter(Boolean).length;
+              const lim = Number(s.daily_upload_limit) || 1;
+              return (
+                <div className="small muted" style={{ marginTop: 4 }}>
+                  One video per time: <b>{Math.min(n, lim)} per day</b> with these settings.
+                  {n < lim && <> <span className="warn-text">The limit is {lim} but there are only {n} times.</span>{" "}
+                    <button className="tiny" type="button" onClick={() => setTimes(spreadTimes(lim))}>Spread {lim} times evenly (09:00–23:30)</button></>}
+                </div>
+              );
+            })()}
+          </div>
           <label>Minimum lead time (minutes)</label>
           <input type="number" min={15} value={s.min_lead_minutes} onChange={num("min_lead_minutes")} />
           <label>Human approval</label>

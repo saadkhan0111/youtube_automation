@@ -401,7 +401,7 @@ def quota_clear():
 class SettingsBody(BaseModel):
     enabled: bool | None = None
     timezone: str | None = None
-    daily_upload_limit: int | None = Field(None, ge=1, le=20)
+    daily_upload_limit: int | None = Field(None, ge=1, le=50)
     publishing_times: list[str] | None = None
     approval_required: bool | None = None
     default_privacy: Literal["private", "unlisted"] | None = None

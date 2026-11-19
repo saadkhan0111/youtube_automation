@@ -776,3 +776,48 @@ def test_live_rejects_streams_that_are_not_live(client, monkeypatch):
                                                                             "url": url, "stream_url": None, "headers": {}})
         r = client.post("/api/clipper/live", json={"url": "https://youtu.be/x", "permission_status": "original"}, headers=H)
         assert r.status_code == 400 and text in r.json()["detail"]
+
+
+@needs_ffmpeg
+def test_quick_render_without_title_generates_metadata_from_the_clip(client, tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_meta(system, user, schema):
+        seen["user"] = user
+        return {"title": "Bro really parked it on the roof", "description": "The landing nobody expected.",
+                "tags": ["gta 6", "gta 6 funny"], "hashtags": ["#GTA6", "GTA6Funny"], "what_happens": "car lands on a roof"}
+
+    monkeypatch.setattr(ai, "json_hook", fake_meta)
+    monkeypatch.setattr(ai, "transcribe_hook", lambda p: {"text": "no way he landed that", "segments": [], "words": []})
+    src = make_source(tmp_path / "s.mp4", seconds=40)
+    r = client.post("/api/clipper/projects", json={"source_path": str(src), "plain": True, "permission_status": "original",
+                                                   "source_creator": "Streamer", "source_url": "https://youtube.com/watch?v=x",
+                                                   "min_clip_seconds": 10, "max_clip_seconds": 20}, headers=H)
+    pid = r.json()["id"]
+    c = client.get(f"/api/clipper/projects/{pid}").json()["candidates"][0]
+    assert not c["headline"]
+    client.post(f"/api/clipper/projects/{pid}/render", json={"candidate_ids": [c["id"]]}, headers=H)
+    c2 = next(x for x in client.get(f"/api/clipper/projects/{pid}").json()["candidates"] if x["id"] == c["id"])
+    assert c2["status"] == "rendered", c2
+    assert "no way he landed that" in seen["user"] and "Streamer" in seen["user"]       # the clip's own speech was used
+    with db.session_scope() as s:
+        v = s.get(Video, c2["video_id"])
+        assert v.title == "Bro really parked it on the roof" and v.metadata_source == "clipper"
+        assert v.description.startswith("The landing nobody expected.")
+        assert "Clip from Streamer's stream: https://youtube.com/watch?v=x" in v.description
+        assert json.loads(v.hashtags_json)[:3] == ["#Shorts", "#GTA6", "#GTA6Funny"] and "gta 6 funny" in json.loads(v.tags_json)
+
+
+@needs_ffmpeg
+def test_quick_render_falls_back_when_ai_is_unavailable(client, tmp_path, monkeypatch):
+    src = make_source(tmp_path / "s.mp4", seconds=40)
+    r = client.post("/api/clipper/projects", json={"source_path": str(src), "plain": True, "permission_status": "original",
+                                                   "name": "My stream", "min_clip_seconds": 10, "max_clip_seconds": 20}, headers=H)
+    pid = r.json()["id"]
+    monkeypatch.setattr(cs, "openai_available", lambda: False)
+    c = client.get(f"/api/clipper/projects/{pid}").json()["candidates"][0]
+    client.post(f"/api/clipper/projects/{pid}/render", json={"candidate_ids": [c["id"]]}, headers=H)
+    c2 = next(x for x in client.get(f"/api/clipper/projects/{pid}").json()["candidates"] if x["id"] == c["id"])
+    with db.session_scope() as s:
+        v = s.get(Video, c2["video_id"])
+        assert c2["status"] == "rendered" and v.title == "My stream" and v.description == "Clip"

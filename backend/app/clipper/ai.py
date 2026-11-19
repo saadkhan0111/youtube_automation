@@ -51,12 +51,20 @@ def transcribe(audio_path: Path) -> dict:
     }
 
 
-def generate_json(system: str, user: str, schema: dict, name: str = "result") -> dict:
+def generate_json(system: str, user: str, schema: dict, name: str = "result", images: list[bytes] | None = None) -> dict:
+    """Structured JSON. `images` (JPEG bytes) are attached to the user message so the model can see video frames."""
     if json_hook is not None:
         return json_hook(system, user, schema)
+    content: str | list = user
+    if images:
+        import base64
+
+        content = [{"type": "text", "text": user}] + [
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(b).decode(), "detail": "low"}}
+            for b in images]
     r = client().chat.completions.create(
         model=cs.OPENAI_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": content}],
         response_format={"type": "json_schema", "json_schema": {"name": name, "schema": schema, "strict": True}},
     )
     choice = r.choices[0]

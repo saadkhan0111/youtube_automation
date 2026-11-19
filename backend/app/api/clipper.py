@@ -125,7 +125,7 @@ class ProjectOptions(BaseModel):
     source_creator: str | None = None
     permission_status: str = "unknown"
     permission_notes: str | None = None
-    max_candidates: int = Field(8, ge=1, le=30)
+    max_candidates: int = Field(8, ge=1, le=100)
     min_clip_seconds: int = Field(20, ge=8, le=120)
     max_clip_seconds: int = Field(60, ge=10, le=180)
     voice: str | None = None

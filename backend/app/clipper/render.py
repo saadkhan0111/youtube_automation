@@ -25,8 +25,9 @@ from ..db import session_scope
 from ..events import record_event
 from ..models import CandidateStatus, ClipCandidate, ClipProject
 from ..services import ingest
+from ..services.metadata_rules import clean_hashtags
 from ..services.validation import validate_video
-from . import ai, avatar, captions, effects, framing, media, voice
+from . import ai, avatar, captions, effects, framing, media, titles, voice
 from . import settings as cs
 from .analysis import load_transcript
 
@@ -354,12 +355,22 @@ def _render(cid: int, preview: bool = False) -> Path | None:
         "original_commentary": " / ".join(v[3] for v in voices) or None,
     }
     if plain:
-        # quick mode: no AI metadata. Title = your title card text (or the project name); the description credits
-        # the creator and links the original stream.
-        title = headline or f"{project['name']}"[:95]
+        # quick mode: your typed title is used as is. Without one, the title/description/tags are generated from
+        # this clip (frames + what's said in it). The description always credits the creator and links the stream.
         credit = f"Clip from {project['source_creator']}'s stream" if project["source_creator"] else "Clip"
-        sidecar.update({"title": title, "hashtags": ["#Shorts"], "tags": [],
-                        "description": f"{credit}: {project['source_url']}" if project["source_url"] else credit})
+        credit_line = f"{credit}: {project['source_url']}" if project["source_url"] else credit
+        meta = None
+        if not headline:
+            _update(cid, render_progress=0.96)
+            meta = titles.for_render(out, DO, project["name"], project["topic_hint"], project["source_creator"])
+        if meta:
+            sidecar.update({"title": meta["title"], "tags": meta["tags"],
+                            "hashtags": clean_hashtags(["#Shorts", *meta["hashtags"]]),
+                            "description": "\n\n".join(x for x in (meta["description"], credit_line) if x),
+                            "context_notes": f"AI (from the clip): {meta['what_happens']}", "transcript": meta["heard"] or None})
+        else:
+            sidecar.update({"title": headline or f"{project['name']}"[:95], "hashtags": ["#Shorts"], "tags": [],
+                            "description": credit_line})
     final = work / f"short_p{project['id']}_m{cid}.mp4"
     out.rename(final)
     side = final.with_suffix(".json")

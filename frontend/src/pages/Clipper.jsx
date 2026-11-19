@@ -215,7 +215,7 @@ function NewProject({ cfg, onClose, onCreated }) {
           <div className="grow"><label>What is this video?</label><input value={f.topic_hint} onChange={set("topic_hint")} placeholder="GTA 5 heist walkthrough" disabled={busy} /></div>
         </div>
         <div className="row">
-          <div className="grow"><label>Moments to find</label><input type="number" min={1} max={30} value={f.max_candidates} onChange={set("max_candidates")} disabled={busy} /></div>
+          <div className="grow"><label>Moments to find</label><input type="number" min={1} max={100} value={f.max_candidates} onChange={set("max_candidates")} disabled={busy} /></div>
           <div className="grow"><label>Min length (s)</label><input type="number" min={8} max={120} value={f.min_clip_seconds} onChange={set("min_clip_seconds")} disabled={busy} /></div>
           <div className="grow"><label>Max length (s)</label><input type="number" min={10} max={180} value={f.max_clip_seconds} onChange={set("max_clip_seconds")} disabled={busy} /></div>
 
